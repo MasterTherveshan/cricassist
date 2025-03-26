@@ -1,5 +1,4 @@
 streamlit
 pandas
-plotly.express
-json
+plotly>=5.0.0
 glob
