@@ -17,40 +17,163 @@ def load_and_combine_data(data_folder="data"):
     and returns a combined DataFrame of ball-by-ball data.
     """
     all_files = glob.glob(os.path.join(data_folder, "*.json"))
-    dfs = []
+    all_dfs = []
     for fpath in all_files:
-        df = convert_match_json_to_ball_df(fpath)
-        dfs.append(df)
+        df_match = convert_match_json_to_ball_df(fpath)
+        if not df_match.empty:
+            all_dfs.append(df_match)
 
-    if len(dfs) > 0:
-        return pd.concat(dfs, ignore_index=True)
-    else:
+    if not all_dfs:
         return pd.DataFrame()
+    return pd.concat(all_dfs, ignore_index=True)
 
+
+##############################
+# 2) CALCULATE DYNAMIC PRESSURE (1ST + 2ND INNINGS)
+##############################
+
+def calculate_dynamic_pressure_for_innings(df_innings, first_innings_total=None):
+    """
+    Revised pressure logic for both innings:
+      1) 1st innings => compare to par, factor in wickets lost & overs used
+      2) 2nd innings => chase logic: runs needed, wickets in hand, overs used
+
+    Then we apply a time_factor to bump up later overs (particularly death overs).
+    """
+    if df_innings.empty:
+        df_innings["DynamicPressureScore"] = np.nan
+        df_innings["DynamicPressureLabel"] = None
+        return df_innings
+
+    if df_innings["Match_Type"].iloc[0] != "T20":
+        df_innings["DynamicPressureScore"] = np.nan
+        df_innings["DynamicPressureLabel"] = None
+        return df_innings
+
+    # Weighted parameters
+    alpha = 1.2
+    beta = 0.8
+
+    # For T20
+    TYPICAL_RUN_RATE = 8.0  # expected run rate
+    # We'll scale parDeficit by 35 for 1st innings
+    # We'll scale required RR by 7 in 2nd innings (since typical ~8 => near 1.14 baseline)
+    # We'll define a small overs-based multiplier that grows from ~1.0 to ~1.5 as oversUsed goes from 0..20:
+    # time_factor = 1 + (oversUsed/40). => e.g. oversUsed=20 => factor=1.5
+    # This ensures death overs => higher base pressure.
+
+    runs_cumulative = 0
+    wickets_cumulative = 0
+    legal_balls_count = 0
+
+    inn_idx = df_innings["Innings_Index"].iloc[0]
+
+    scores = []
+    for i, row in df_innings.iterrows():
+        runs_cumulative += row["Runs_Total"]
+        if row["Wicket"]:
+            wickets_cumulative += 1
+        if row["IsLegalDelivery"] == 1:
+            legal_balls_count += 1
+
+        wickets_in_hand = 10 - wickets_cumulative
+        overs_used = legal_balls_count / 6.0
+
+        # time factor
+        time_factor = 1.0 + (overs_used / 40.0)  # ranges ~1.0 -> 1.5
+
+        if inn_idx == 1:
+            # -------- FIRST INNINGS --------
+            expected_runs_so_far = TYPICAL_RUN_RATE * overs_used
+            par_deficit = expected_runs_so_far - runs_cumulative
+            if par_deficit < 0:
+                par_deficit = 0  # if you're above par, no "extra" pressure from the deficit
+
+            if wickets_in_hand <= 0 or overs_used >= 20:
+                # innings basically done
+                pressure_score = 0
+            else:
+                # scale parDeficit / 35
+                part1 = alpha * (par_deficit / 35.0)
+                part2 = beta * (1.0 - (wickets_in_hand / 10.0))
+                base_score = part1 + part2
+                pressure_score = base_score * time_factor
+
+        else:
+            # -------- SECOND INNINGS --------
+            if not first_innings_total:
+                # if we don't know the target, skip
+                pressure_score = np.nan
+            else:
+                runs_needed = first_innings_total - runs_cumulative + 1
+                balls_left = 120 - legal_balls_count  # total T20 = 120 legal deliveries
+
+                if runs_needed <= 0 or balls_left <= 0 or wickets_in_hand <= 0:
+                    pressure_score = 0
+                else:
+                    req_run_rate = runs_needed / (balls_left / 6.0)
+                    part1 = alpha * (req_run_rate / 7.0)  # scale by 7
+                    part2 = beta * (1.0 - (wickets_in_hand / 10.0))
+                    base_score = part1 + part2
+                    pressure_score = base_score * time_factor
+
+        scores.append(pressure_score)
+
+    df_innings["DynamicPressureScore"] = scores
+
+    # Label
+    def label_pressure(val):
+        if pd.isna(val):
+            return None
+        # Adjust the thresholds so we get more variety
+        if val < 1.0:
+            return "Low"
+        elif val < 2.0:
+            return "Medium"
+        elif val < 3.0:
+            return "High"
+        else:
+            return "Extreme"
+
+    df_innings["DynamicPressureLabel"] = df_innings["DynamicPressureScore"].apply(label_pressure)
+    return df_innings
+
+
+##############################
+# 3) CONVERT MATCH JSON => BALL DF
+##############################
 
 def convert_match_json_to_ball_df(file_path):
-    """
-    Reads a single match JSON and returns a DataFrame of deliveries
-    with columns needed for subsequent metric calculations.
-
-    Also deduces Game Phase => Pressure for T20 or 50-over logic
-    and extracts the 'season' field for filtering.
-    """
     with open(file_path, "r") as f:
         match_data = json.load(f)
 
     teams = match_data["info"].get("teams", [])
     match_type = match_data["info"].get("match_type", "T20")
-    season = match_data["info"].get("season", "Unknown")  # Grab the season
+    season = match_data["info"].get("season", "Unknown")
+
+    innings_list = match_data.get("innings", [])
+    if not innings_list:
+        return pd.DataFrame()
+
+    # 1st innings total
+    first_inn_runs = 0
+    if len(innings_list) >= 1:
+        for over_dict in innings_list[0].get("overs", []):
+            for delivery in over_dict.get("deliveries", []):
+                first_inn_runs += delivery.get("runs", {}).get("total", 0)
 
     ball_data = []
-    innings_list = match_data.get("innings", [])
-    for innings_index, innings in enumerate(innings_list, start=1):
-        batting_team = innings.get("team")
+
+    def is_legal_delivery(delivery):
+        extras = delivery.get("extras", {})
+        return not ("wides" in extras or "noballs" in extras)
+
+    for inn_idx, inn_data in enumerate(innings_list, start=1):
+        batting_team = inn_data.get("team")
         bowling_team = [t for t in teams if t != batting_team][0] if len(teams) > 1 else None
 
-        for over_dict in innings.get("overs", []):
-            over_number = over_dict.get("over", 0)
+        for over_dict in inn_data.get("overs", []):
+            over_num = over_dict.get("over", 0)
             deliveries = over_dict.get("deliveries", [])
             for ball_index, delivery in enumerate(deliveries):
                 total_runs = delivery.get("runs", {}).get("total", 0)
@@ -60,24 +183,27 @@ def convert_match_json_to_ball_df(file_path):
                 row = {
                     "Match_File": os.path.basename(file_path),
                     "Season": season,
-                    "Innings_Index": innings_index,
+                    "Innings_Index": inn_idx,
                     "Batting_Team": batting_team,
                     "Bowling_Team": bowling_team,
                     "Batter": delivery.get("batter"),
                     "Non_Striker": delivery.get("non_striker"),
                     "Bowler": delivery.get("bowler"),
-                    "Over": over_number,
+                    "Over": over_num,
                     "Ball_In_Over": ball_index + 1,
                     "Runs_Total": total_runs,
                     "Runs_Batter": batter_runs,
                     "Wicket": wicket_fell,
-                    "Match_Type": match_type
+                    "Match_Type": match_type,
+                    "IsLegalDelivery": 1 if is_legal_delivery(delivery) else 0
                 }
                 ball_data.append(row)
 
     df = pd.DataFrame(ball_data)
+    if df.empty:
+        return df
 
-    # Determine Game Phase => Pressure
+    # Static old logic if you want it
     def game_phase_t20(over):
         if over < 6:
             return "Powerplay"
@@ -94,42 +220,39 @@ def convert_match_json_to_ball_df(file_path):
         else:
             return "Death"
 
-    if not df.empty:
-        if df["Match_Type"].iloc[0] == "T20":
-            df["Game_Phase"] = df["Over"].apply(game_phase_t20)
+    if match_type == "T20":
+        df["Game_Phase"] = df["Over"].apply(game_phase_t20)
+    else:
+        df["Game_Phase"] = df["Over"].apply(game_phase_50)
+
+    phase_map = {"Powerplay": "Low", "Middle": "Medium", "Death": "High"}
+    df["Pressure"] = df["Game_Phase"].map(phase_map)
+
+    # Split by innings, apply dynamic
+    out_chunks = []
+    for (mf, idx), chunk in df.groupby(["Match_File", "Innings_Index"]):
+        chunk = chunk.copy()
+        if idx == 2:
+            chunk = calculate_dynamic_pressure_for_innings(chunk, first_innings_total=first_inn_runs)
         else:
-            df["Game_Phase"] = df["Over"].apply(game_phase_50)
+            chunk = calculate_dynamic_pressure_for_innings(chunk, first_innings_total=None)
+        out_chunks.append(chunk)
 
-        phase_to_pressure = {
-            "Powerplay": "Low",
-            "Middle": "Medium",
-            "Death": "High"
-        }
-        df["Pressure"] = df["Game_Phase"].map(phase_to_pressure)
-
-    return df
+    return pd.concat(out_chunks, ignore_index=True)
 
 
 ##############################
-# 2) HELPER: GAMES PLAYED
+# 4) GAMES PLAYED HELPERS
 ##############################
 
 def compute_batting_games_played(df):
-    """
-    For each Batter, how many unique Match_File did they bat in?
-    """
-    # Keep rows where Batter is not null
     sub = df.dropna(subset=["Batter"])[["Batter", "Match_File"]].drop_duplicates()
-    # Group by Batter => count distinct Match_File
     out = sub.groupby("Batter")["Match_File"].nunique().reset_index()
     out.rename(columns={"Match_File": "GamesPlayed"}, inplace=True)
     return out
 
 
 def compute_bowling_games_played(df):
-    """
-    For each Bowler, how many unique Match_File did they bowl in?
-    """
     sub = df.dropna(subset=["Bowler"])[["Bowler", "Match_File"]].drop_duplicates()
     out = sub.groupby("Bowler")["Match_File"].nunique().reset_index()
     out.rename(columns={"Match_File": "GamesPlayed"}, inplace=True)
@@ -137,77 +260,101 @@ def compute_bowling_games_played(df):
 
 
 ##############################
-# 3) PRESSURE ANALYSIS
+# 5) METRICS BY PRESSURE
 ##############################
 
-def compute_batting_metrics_by_pressure(df):
+def compute_batting_metrics_by_pressure(df, pressure_col="DynamicPressureLabel"):
     """
-    Group by Batter & Pressure => Runs, Balls, Dismissals, Strike Rate
+    Group by Batter & a chosen 'pressure' column => Runs, legitimate Balls, Dismissals, SR, DotBall%.
     """
     if df.empty:
-        return pd.DataFrame(columns=["Batter", "Pressure", "Runs", "Balls", "Dismissals", "StrikeRate"])
+        return pd.DataFrame(columns=["Batter", pressure_col, "Runs", "Balls", "Dismissals", "StrikeRate", "DotBallPct"])
 
-    df = df.dropna(subset=["Batter"]).copy()
-    df["Balls_Faced"] = 1
+    sub = df.dropna(subset=["Batter"]).copy()
+    sub["Balls_Faced"] = sub["IsLegalDelivery"]
 
-    grp_cols = ["Batter", "Pressure"]
-    grouped = df.groupby(grp_cols).agg(
+    # Dot ball => runs_batter=0, no wicket, islegal=1
+    sub["DotBall"] = sub.apply(
+        lambda row: 1 if (row["Runs_Batter"] == 0 and not row["Wicket"] and row["IsLegalDelivery"] == 1) else 0,
+        axis=1
+    )
+
+    grouped = sub.groupby(["Batter", pressure_col], dropna=True).agg(
         Runs=("Runs_Batter", "sum"),
         Balls=("Balls_Faced", "sum"),
-        Dismissals=("Wicket", "sum")
+        Dismissals=("Wicket", "sum"),
+        Dots=("DotBall", "sum")
     ).reset_index()
 
-    grouped["StrikeRate"] = (grouped["Runs"] / grouped["Balls"]) * 100
+    grouped["StrikeRate"] = grouped.apply(
+        lambda row: (row["Runs"] / row["Balls"] * 100) if row["Balls"] > 0 else 0,
+        axis=1
+    )
+    grouped["DotBallPct"] = grouped.apply(
+        lambda row: row["Dots"] / row["Balls"] if row["Balls"] > 0 else 0,
+        axis=1
+    )
     return grouped
 
 
-def compute_bowling_metrics_by_pressure(df):
+def compute_bowling_metrics_by_pressure(df, pressure_col="DynamicPressureLabel"):
     """
-    Group by Bowler & Pressure => runs, balls, wickets => economy
+    Group by Bowler & a chosen 'pressure' column => Runs, legitimate Balls, Wickets => Economy, DotBall%.
     """
     if df.empty:
-        return pd.DataFrame(columns=["Bowler", "Pressure", "Balls", "Runs", "Wickets", "Economy"])
+        return pd.DataFrame(columns=["Bowler", pressure_col, "Balls", "Runs", "Wickets", "Economy", "DotBallPct"])
 
-    df = df.dropna(subset=["Bowler"]).copy()
-    df["Balls_Bowled"] = 1
+    sub = df.dropna(subset=["Bowler"]).copy()
+    sub["Balls_Bowled"] = sub["IsLegalDelivery"]
 
-    grp_cols = ["Bowler", "Pressure"]
-    grouped = df.groupby(grp_cols).agg(
+    # Dot ball => runs_batter=0, islegal=1
+    sub["DotBall"] = sub.apply(
+        lambda row: 1 if (row["Runs_Batter"] == 0 and row["IsLegalDelivery"] == 1) else 0,
+        axis=1
+    )
+
+    grouped = sub.groupby(["Bowler", pressure_col], dropna=True).agg(
         Balls=("Balls_Bowled", "sum"),
         Runs=("Runs_Total", "sum"),
-        Wickets=("Wicket", "sum")
+        Wickets=("Wicket", "sum"),
+        Dots=("DotBall", "sum")
     ).reset_index()
 
     grouped["Overs"] = grouped["Balls"] / 6.0
     grouped["Economy"] = grouped.apply(lambda row: row["Runs"] / row["Overs"] if row["Overs"] > 0 else 0, axis=1)
+    grouped["DotBallPct"] = grouped.apply(
+        lambda row: row["Dots"] / row["Balls"] if row["Balls"] > 0 else 0,
+        axis=1
+    )
     return grouped
 
 
 ##############################
-# 4) ADVANCED BATTING METRICS
+# 6) ADVANCED BATTING + BOWLING
 ##############################
 
 def compute_advanced_batting_metrics(df):
     """
-    6 batting metrics:
-      1) Total_Runs
-      2) Average
-      3) StrikeRate
-      4) Finisher
-      5) BoundaryRate
-      6) DotBallPct
+    Return typical advanced metrics:
+      - Total_Runs, Avg, SR, Finisher, BoundaryRate, DotBallPct
     """
     if df.empty:
-        return pd.DataFrame(columns=["Batter", "Total_Runs", "Average", "StrikeRate",
-                                     "Finisher", "BoundaryRate", "DotBallPct"])
+        return pd.DataFrame(
+            columns=["Batter", "Total_Runs", "Average", "StrikeRate", "Finisher", "BoundaryRate", "DotBallPct"])
 
-    df = df.copy()
-    df["Balls_Faced"] = 1
-    df["Is_Boundary"] = df["Runs_Batter"].apply(lambda x: 1 if x in [4, 6] else 0)
-    df["Is_Dot"] = df.apply(lambda row: 1 if (row["Runs_Batter"] == 0 and not row["Wicket"]) else 0, axis=1)
+    sub = df.dropna(subset=["Batter"]).copy()
+    sub["Balls_Faced"] = sub["IsLegalDelivery"]
 
-    # Per-innings summary
-    per_innings = df.groupby(["Match_File", "Innings_Index", "Batter"], dropna=True).agg(
+    sub["Is_Boundary"] = sub.apply(
+        lambda row: 1 if (row["Runs_Batter"] in [4, 6] and row["IsLegalDelivery"] == 1) else 0,
+        axis=1
+    )
+    sub["Is_Dot"] = sub.apply(
+        lambda row: 1 if (row["Runs_Batter"] == 0 and not row["Wicket"] and row["IsLegalDelivery"] == 1) else 0,
+        axis=1
+    )
+
+    per_innings = sub.groupby(["Match_File", "Innings_Index", "Batter"], dropna=True).agg(
         RunsSum=("Runs_Batter", "sum"),
         BallsSum=("Balls_Faced", "sum"),
         WicketsSum=("Wicket", "sum"),
@@ -229,7 +376,8 @@ def compute_advanced_batting_metrics(df):
 
     final["Average"] = final.apply(
         lambda row: row["Total_Runs"] / row["Total_Wickets"] if row["Total_Wickets"] > 0 else row["Total_Runs"], axis=1)
-    final["StrikeRate"] = (final["Total_Runs"] / final["Balls_Faced"] * 100).fillna(0)
+    final["StrikeRate"] = final.apply(
+        lambda row: (row["Total_Runs"] / row["Balls_Faced"] * 100) if row["Balls_Faced"] > 0 else 0, axis=1)
     final["Finisher"] = final.apply(
         lambda row: row["FinisherCount"] / row["Innings_Count"] if row["Innings_Count"] > 0 else 0, axis=1)
     final["BoundaryRate"] = final.apply(
@@ -240,63 +388,57 @@ def compute_advanced_batting_metrics(df):
     return final[["Batter", "Total_Runs", "Average", "StrikeRate", "Finisher", "BoundaryRate", "DotBallPct"]]
 
 
-##############################
-# 5) ADVANCED BOWLING METRICS
-##############################
-
 def compute_advanced_bowling_metrics(df):
     """
-    6 bowling metrics:
-      1) Wickets
-      2) Economy
-      3) StrikeRate (balls/wicket)
-      4) BounceBackRate
-      5) KeyWicketIndex
-      6) DeathOversEconomy
+    Return advanced metrics:
+      - Wickets, Economy, StrikeRate, BounceBackRate, KeyWicketIndex, DeathOversEconomy
     """
     if df.empty:
-        return pd.DataFrame(columns=["Bowler", "Wickets", "Economy", "StrikeRate",
-                                     "BounceBackRate", "KeyWicketIndex", "DeathOversEconomy"])
+        return pd.DataFrame(columns=["Bowler", "Wickets", "Economy", "StrikeRate", "BounceBackRate", "KeyWicketIndex",
+                                     "DeathOversEconomy"])
 
-    df = df.dropna(subset=["Bowler"]).copy()
-    df["Balls_Bowled"] = 1
-    df.sort_values(["Bowler", "Match_File", "Innings_Index", "Over", "Ball_In_Over"], inplace=True)
+    sub = df.dropna(subset=["Bowler"]).copy()
+    sub["Balls_Bowled"] = sub["IsLegalDelivery"]
+    sub.sort_values(["Bowler", "Match_File", "Innings_Index", "Over", "Ball_In_Over"], inplace=True)
 
-    # 1) Bounce Back Rate
-    bounce_events = []
-    for bowler, group in df.groupby("Bowler"):
-        group = group.reset_index(drop=True)
+    # Bounce Back Rate
+    bounce_data = []
+    for bowler, grp in sub.groupby("Bowler"):
+        grp = grp.reset_index(drop=True)
         boundaries = 0
         bounce = 0
-        for i in range(len(group) - 1):
-            runs_bat = group.loc[i, "Runs_Batter"]
-            if runs_bat in [4, 6]:
-                next_runs = group.loc[i + 1, "Runs_Batter"]
-                next_wicket = group.loc[i + 1, "Wicket"]
-                if (next_runs == 0 and not next_wicket) or next_wicket:
-                    bounce += 1
-                boundaries += 1
-        bounce_events.append({"Bowler": bowler, "Boundaries": boundaries, "BounceBacks": bounce})
+        for i in range(len(grp) - 1):
+            if grp.loc[i, "IsLegalDelivery"] == 1:
+                runs_bat = grp.loc[i, "Runs_Batter"]
+                if runs_bat in [4, 6]:
+                    if i + 1 < len(grp):
+                        next_legal = grp.loc[i + 1, "IsLegalDelivery"]
+                        next_runs = grp.loc[i + 1, "Runs_Batter"]
+                        next_wicket = grp.loc[i + 1, "Wicket"]
+                        if next_legal == 1:
+                            if (next_runs == 0) or next_wicket:
+                                bounce += 1
+                            boundaries += 1
+        bounce_data.append({"Bowler": bowler, "Boundaries": boundaries, "BounceBacks": bounce})
 
-    bounce_df = pd.DataFrame(bounce_events)
+    bounce_df = pd.DataFrame(bounce_data)
     bounce_df["BounceBackRate"] = bounce_df.apply(
         lambda row: row["BounceBacks"] / row["Boundaries"] if row["Boundaries"] > 0 else 0,
         axis=1
     )
 
-    # 2) Key Wicket => Over < 10
-    df["Is_KeyWicket"] = df.apply(lambda row: 1 if (row["Wicket"] == True and row["Over"] < 10) else 0, axis=1)
+    # Key Wicket => Over < 10
+    sub["Is_KeyWicket"] = sub.apply(lambda r: 1 if (r["Wicket"] == True and r["Over"] < 10) else 0, axis=1)
+    # Death overs => Over >=16
+    sub["Is_DeathOver"] = sub["Over"].apply(lambda x: 1 if x >= 16 else 0)
 
-    # 3) Death Overs => Over >=16
-    df["Is_DeathOver"] = df["Over"].apply(lambda o: 1 if o >= 16 else 0)
-
-    grouped = df.groupby("Bowler").agg(
+    grouped = sub.groupby("Bowler").agg(
         Balls_Bowled=("Balls_Bowled", "sum"),
         Runs_Conceded=("Runs_Total", "sum"),
         Wickets=("Wicket", "sum"),
         KeyWickets=("Is_KeyWicket", "sum"),
         DeathBalls=("Is_DeathOver", "sum"),
-        DeathRuns=("Runs_Total", lambda x: x[df.loc[x.index, "Is_DeathOver"] == 1].sum())
+        DeathRuns=("Runs_Total", lambda x: x[sub.loc[x.index, "Is_DeathOver"] == 1].sum())
     ).reset_index()
 
     grouped["Overs_Bowled"] = grouped["Balls_Bowled"] / 6.0
@@ -317,14 +459,12 @@ def compute_advanced_bowling_metrics(df):
 
 
 ##############################
-# 6) RADAR CHART HELPER
+# 7) RADAR CHART
 ##############################
 
 def create_radar_chart(df, player_col, player_list, metrics, title):
     """
-    df: DataFrame with columns = [player_col, metric1, metric2, ...]
-    We'll do a percentile-based capping (5th..95th) for each metric,
-    then min-max scale to [0..1], then produce a single radar chart.
+    Creates a radar chart using min-max scaling for each metric (clipped at 5th..95th percentile).
     """
     if df.empty or not player_list:
         return None
@@ -333,34 +473,33 @@ def create_radar_chart(df, player_col, player_list, metrics, title):
     if sub.empty:
         return None
 
-    # For each metric, cap outliers (5th..95th) & scale
-    capped_scaled_data = []
+    # For each metric, clip outliers & scale
+    clipped_rows = []
     for _, row in sub.iterrows():
         player_name = row[player_col]
         data_row = {"player": player_name}
         for m in metrics:
-            q_low = df[m].quantile(0.05)
-            q_high = df[m].quantile(0.95)
-            val_capped = np.clip(row[m], q_low, q_high)
-            min_val = df[m].clip(q_low, q_high).min()
-            max_val = df[m].clip(q_low, q_high).max()
-            rng = max_val - min_val if max_val > min_val else 1e-9
-            val_scaled = (val_capped - min_val) / rng
+            val_raw = row[m]
+            low_ = df[m].quantile(0.05)
+            high_ = df[m].quantile(0.95)
+            val_clipped = np.clip(val_raw, low_, high_)
+            min_ = df[m].clip(low_, high_).min()
+            max_ = df[m].clip(low_, high_).max()
+            rng = max_ - min_ if max_ > min_ else 1e-9
+            val_scaled = (val_clipped - min_) / rng
             data_row[m] = val_scaled
-        capped_scaled_data.append(data_row)
+        clipped_rows.append(data_row)
 
     radar_data = []
-    for row in capped_scaled_data:
-        player_name = row["player"]
+    for row in clipped_rows:
         for m in metrics:
             radar_data.append({
-                "player": player_name,
+                "player": row["player"],
                 "Metric": m,
                 "Value": row[m]
             })
 
     radar_df = pd.DataFrame(radar_data)
-
     fig = px.line_polar(
         radar_df,
         r="Value",
@@ -381,232 +520,162 @@ def create_radar_chart(df, player_col, player_list, metrics, title):
 
 
 ##############################
-# 7) STREAMLIT APP
+# 8) STREAMLIT APP
 ##############################
 
 def main():
-    st.set_page_config(
-        page_title="Cric Assist - Season & Games Filter",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
+    st.set_page_config(page_title="Cric Assist - Enhanced Pressure", layout="wide")
+    st.title("Cric Assist - Enhanced Pressure for Both Innings")
 
-    # Teal/blue gradient
-    st.markdown("""
-        <style>
-        .main {
-            background: linear-gradient(120deg, #B2F7EF 0%, #7DF9FF 50%, #B2F7EF 100%);
-            color: #1f3c56;
-        }
-        .css-18e3th9 {
-            background-color: #1f3c56 !important;
-        }
-        .css-1d391kg {
-            color: #f0f6ff !important;
-        }
-        .st-radio > label {
-            font-weight:600;
-        }
-        .css-12oz5g7 {
-            font-weight:600;
-        }
-        .css-ffhzg2 {
-            color:#f0f6ff !important;
-        }
-        </style>
-        """,
-                unsafe_allow_html=True
-                )
-
-    st.title("Cric Assist - Season & Games Filter")
-    st.markdown("Filter by season(s) and minimum games played, then explore pressure-based or advanced metrics.")
-
-    # Load data
     df_all = load_and_combine_data("data")
     if df_all.empty:
-        st.warning("No data found in the 'data' folder.")
+        st.warning("No data found. Place JSON files in 'data' folder.")
         return
 
-    # ========== Season Filter ==========
+    # Filter by season
     seasons = sorted(df_all["Season"].dropna().unique().tolist())
     if seasons:
-        selected_seasons = st.multiselect("Select Season(s):", seasons, default=seasons)
-        # Filter by season
+        selected_seasons = st.multiselect("Select Seasons", seasons, default=seasons)
         df_all = df_all[df_all["Season"].isin(selected_seasons)]
-    else:
-        st.info("No season data found.")
-
     if df_all.empty:
         st.warning("No data after filtering by season(s).")
         return
 
-    # ========== Min Games Filter ==========
+    # Minimum games
     st.write("### Minimum Games Played Filter")
-    min_games = st.number_input("Minimum number of games", min_value=1, value=5)
+    min_games = st.number_input("Minimum number of games", min_value=1, value=3)
 
-    # We'll apply the min games filter to each aggregator result.
-    # Because "games played" differs for batters vs bowlers, we'll compute them separately.
+    tabs = st.tabs([
+        "Batting - Dynamic Pressure",
+        "Bowling - Dynamic Pressure",
+        "Advanced Metrics + Radar",
+        "Raw Data Preview"
+    ])
 
-    # TABS
-    tab1, tab2, tab3 = st.tabs(["Pressure Analysis (Batting)", "Pressure Analysis (Bowling)", "Advanced Radar"])
-
-    ######################
-    # Tab 1: Batting Pressure
-    ######################
-    with tab1:
-        st.subheader("Batting Under Different Pressure Situations")
-
-        # 1) Compute the aggregator
-        batting_pressure_df = compute_batting_metrics_by_pressure(df_all)
-
-        # 2) Compute games played for batters
-        batting_games_df = compute_batting_games_played(df_all)
-
-        # 3) Merge to add "GamesPlayed"
-        batting_pressure_df = batting_pressure_df.merge(batting_games_df, on="Batter", how="left")
-        # 4) Filter by min_games
-        batting_pressure_df = batting_pressure_df[batting_pressure_df["GamesPlayed"] >= min_games]
-
-        if batting_pressure_df.empty:
-            st.info("No batters match the min games criteria or data is empty.")
+    # BATTING - DYNAMIC PRESSURE
+    with tabs[0]:
+        st.subheader("Batting Metrics By Enhanced Pressure Label")
+        bat_pressure = compute_batting_metrics_by_pressure(df_all, pressure_col="DynamicPressureLabel")
+        if bat_pressure.empty:
+            st.info("No batting data or no dynamic pressure calculated.")
         else:
-            players = sorted(batting_pressure_df["Batter"].unique().tolist())
-            default_sel = ["AK Markram", "T Stubbs", "RD Rickelton"]
-            default_sel = [p for p in default_sel if p in players]
-            selected = st.multiselect("Select batters:", players, default=default_sel)
-
-            if selected:
-                sub = batting_pressure_df[batting_pressure_df["Batter"].isin(selected)].copy()
-                if not sub.empty:
-                    st.write("### Batting Metrics by Pressure")
-                    st.dataframe(sub)
-
-                    fig = px.bar(
-                        sub,
-                        x="Pressure",
-                        y="StrikeRate",
-                        color="Batter",
-                        barmode="group",
-                        title="Strike Rate by Pressure (Batting)",
-                        color_discrete_sequence=px.colors.sequential.Teal
-                    )
-                    fig.update_layout(
-                        xaxis=dict(title="Pressure Situation"),
-                        yaxis=dict(title="Strike Rate"),
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        paper_bgcolor="rgba(0,0,0,0)"
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-
-    ######################
-    # Tab 2: Bowling Pressure
-    ######################
-    with tab2:
-        st.subheader("Bowling Under Different Pressure Situations")
-
-        bowling_pressure_df = compute_bowling_metrics_by_pressure(df_all)
-        bowling_games_df = compute_bowling_games_played(df_all)
-        bowling_pressure_df = bowling_pressure_df.merge(bowling_games_df, on="Bowler", how="left")
-        bowling_pressure_df = bowling_pressure_df[bowling_pressure_df["GamesPlayed"] >= min_games]
-
-        if bowling_pressure_df.empty:
-            st.info("No bowlers match the min games criteria or data is empty.")
-        else:
-            bowlers = sorted(bowling_pressure_df["Bowler"].unique().tolist())
-            default_sel_bowl = bowlers[:2]
-            selected_bowl = st.multiselect("Select bowlers:", bowlers, default=default_sel_bowl)
-
-            if selected_bowl:
-                sub_bowl = bowling_pressure_df[bowling_pressure_df["Bowler"].isin(selected_bowl)].copy()
-                if not sub_bowl.empty:
-                    st.write("### Bowling Metrics by Pressure")
-                    st.dataframe(sub_bowl)
-
-                    fig2 = px.bar(
-                        sub_bowl,
-                        x="Pressure",
-                        y="Economy",
-                        color="Bowler",
-                        barmode="group",
-                        title="Economy by Pressure (Bowling)",
-                        color_discrete_sequence=px.colors.sequential.Tealgrn
-                    )
-                    fig2.update_layout(
-                        xaxis=dict(title="Pressure Situation"),
-                        yaxis=dict(title="Economy (runs per over)"),
-                        plot_bgcolor="rgba(0,0,0,0)",
-                        paper_bgcolor="rgba(0,0,0,0)"
-                    )
-                    st.plotly_chart(fig2, use_container_width=True)
-
-    ######################
-    # Tab 3: Advanced Radar
-    ######################
-    with tab3:
-        st.subheader("Advanced Metrics Radar Charts")
-
-        mode = st.radio("Choose a discipline:", ["Batting", "Bowling"], horizontal=True)
-
-        if mode == "Batting":
-            # 1) aggregator
-            batting_advanced = compute_advanced_batting_metrics(df_all)
-            # 2) games played
-            batting_games_df = compute_batting_games_played(df_all)
-            # 3) merge & filter
-            batting_advanced = batting_advanced.merge(batting_games_df, on="Batter", how="left")
-            batting_advanced = batting_advanced[batting_advanced["GamesPlayed"] >= min_games]
-
-            if batting_advanced.empty:
-                st.warning("No batting data after applying filters.")
+            bat_games = compute_batting_games_played(df_all)
+            merged_bat = bat_pressure.merge(bat_games, on="Batter", how="left")
+            merged_bat = merged_bat[merged_bat["GamesPlayed"] >= min_games]
+            if merged_bat.empty:
+                st.info("No batters meet the min games criteria.")
             else:
-                st.write("#### All Batters' Advanced Metrics (Raw)")
-                st.dataframe(batting_advanced)
+                all_batters = sorted(merged_bat["Batter"].unique().tolist())
+                selected_batters = st.multiselect("Select Batters to Compare", all_batters, default=all_batters[:3])
 
-                all_batters = sorted(batting_advanced["Batter"].unique().tolist())
-                default_sel_bat = ["AK Markram", "T Stubbs", "RD Rickelton"]
-                default_sel_bat = [p for p in default_sel_bat if p in all_batters]
-                sel_batters = st.multiselect("Select batters for radar:", all_batters, default=default_sel_bat)
+                sub_bat = merged_bat[merged_bat["Batter"].isin(selected_batters)]
+                st.dataframe(sub_bat)
 
-                if sel_batters:
-                    metrics_batting = ["Total_Runs", "Average", "StrikeRate", "Finisher", "BoundaryRate", "DotBallPct"]
-                    fig_radar = create_radar_chart(
-                        batting_advanced,
-                        player_col="Batter",
-                        player_list=sel_batters,
-                        metrics=metrics_batting,
-                        title="Batting Radar (6 Metrics)"
-                    )
-                    if fig_radar:
-                        st.plotly_chart(fig_radar, use_container_width=True)
+                fig_bat = px.bar(
+                    sub_bat,
+                    x="DynamicPressureLabel",
+                    y="StrikeRate",
+                    color="Batter",
+                    barmode="group",
+                    title="Batting Strike Rate by Enhanced Pressure",
+                )
+                fig_bat.update_layout(xaxis_title="Pressure", yaxis_title="Strike Rate")
+                st.plotly_chart(fig_bat, use_container_width=True)
 
+                fig_bat2 = px.bar(
+                    sub_bat,
+                    x="DynamicPressureLabel",
+                    y="DotBallPct",
+                    color="Batter",
+                    barmode="group",
+                    title="Dot Ball % by Enhanced Pressure",
+                )
+                fig_bat2.update_layout(xaxis_title="Pressure", yaxis_title="Dot Ball Percentage")
+                st.plotly_chart(fig_bat2, use_container_width=True)
+
+    # BOWLING - DYNAMIC PRESSURE
+    with tabs[1]:
+        st.subheader("Bowling Metrics By Enhanced Pressure Label")
+        bowl_pressure = compute_bowling_metrics_by_pressure(df_all, pressure_col="DynamicPressureLabel")
+        if bowl_pressure.empty:
+            st.info("No bowling data or no dynamic pressure calculated.")
         else:
-            bowling_advanced = compute_advanced_bowling_metrics(df_all)
-            bowling_games_df = compute_bowling_games_played(df_all)
-            bowling_advanced = bowling_advanced.merge(bowling_games_df, on="Bowler", how="left")
-            bowling_advanced = bowling_advanced[bowling_advanced["GamesPlayed"] >= min_games]
-
-            if bowling_advanced.empty:
-                st.warning("No bowling data after applying filters.")
+            bowl_games = compute_bowling_games_played(df_all)
+            merged_bowl = bowl_pressure.merge(bowl_games, on="Bowler", how="left")
+            merged_bowl = merged_bowl[merged_bowl["GamesPlayed"] >= min_games]
+            if merged_bowl.empty:
+                st.info("No bowlers meet the min games criteria.")
             else:
-                st.write("#### All Bowlers' Advanced Metrics (Raw)")
-                st.dataframe(bowling_advanced)
+                all_bowlers = sorted(merged_bowl["Bowler"].unique().tolist())
+                selected_bowlers = st.multiselect("Select Bowlers to Compare", all_bowlers, default=all_bowlers[:3])
 
-                all_bowlers = sorted(bowling_advanced["Bowler"].unique().tolist())
-                default_sel_bowlers = all_bowlers[:2]
-                sel_bowlers = st.multiselect("Select bowlers for radar:", all_bowlers, default=default_sel_bowlers)
+                sub_bowl = merged_bowl[merged_bowl["Bowler"].isin(selected_bowlers)]
+                st.dataframe(sub_bowl)
 
-                if sel_bowlers:
-                    metrics_bowling = ["Wickets", "Economy", "StrikeRate", "BounceBackRate", "KeyWicketIndex",
-                                       "DeathOversEconomy"]
-                    fig_radar_bowl = create_radar_chart(
-                        bowling_advanced,
-                        player_col="Bowler",
-                        player_list=sel_bowlers,
-                        metrics=metrics_bowling,
-                        title="Bowling Radar (6 Metrics)"
-                    )
-                    if fig_radar_bowl:
-                        st.plotly_chart(fig_radar_bowl, use_container_width=True)
+                fig_bowl = px.bar(
+                    sub_bowl,
+                    x="DynamicPressureLabel",
+                    y="Economy",
+                    color="Bowler",
+                    barmode="group",
+                    title="Bowling Economy by Enhanced Pressure"
+                )
+                fig_bowl.update_layout(xaxis_title="Pressure", yaxis_title="Economy (RPO)")
+                st.plotly_chart(fig_bowl, use_container_width=True)
+
+                fig_bowl2 = px.bar(
+                    sub_bowl,
+                    x="DynamicPressureLabel",
+                    y="DotBallPct",
+                    color="Bowler",
+                    barmode="group",
+                    title="Bowling Dot Ball % by Enhanced Pressure"
+                )
+                fig_bowl2.update_layout(xaxis_title="Pressure", yaxis_title="Dot Ball Percentage")
+                st.plotly_chart(fig_bowl2, use_container_width=True)
+
+    # ADVANCED METRICS + RADAR
+    with tabs[2]:
+        st.subheader("Advanced Batting & Bowling + Radar Charts")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("### Batting")
+            adv_bat = compute_advanced_batting_metrics(df_all)
+            bat_games = compute_batting_games_played(df_all)
+            adv_bat = adv_bat.merge(bat_games, on="Batter", how="left")
+            adv_bat = adv_bat[adv_bat["GamesPlayed"] >= min_games]
+            st.dataframe(adv_bat)
+
+            all_bat = sorted(adv_bat["Batter"].unique().tolist())
+            sel_bat = st.multiselect("Select Batters for Radar", all_bat, default=all_bat[:3])
+            if sel_bat:
+                metrics_batting = ["Total_Runs", "Average", "StrikeRate", "Finisher", "BoundaryRate", "DotBallPct"]
+                fig_radar_bat = create_radar_chart(adv_bat, "Batter", sel_bat, metrics_batting, "Batting Radar")
+                if fig_radar_bat:
+                    st.plotly_chart(fig_radar_bat, use_container_width=True)
+
+        with col2:
+            st.write("### Bowling")
+            adv_bowl = compute_advanced_bowling_metrics(df_all)
+            bowl_games = compute_bowling_games_played(df_all)
+            adv_bowl = adv_bowl.merge(bowl_games, on="Bowler", how="left")
+            adv_bowl = adv_bowl[adv_bowl["GamesPlayed"] >= min_games]
+            st.dataframe(adv_bowl)
+
+            all_bowl = sorted(adv_bowl["Bowler"].unique().tolist())
+            sel_bowl = st.multiselect("Select Bowlers for Radar", all_bowl, default=all_bowl[:3])
+            if sel_bowl:
+                metrics_bowling = ["Wickets", "Economy", "StrikeRate", "BounceBackRate", "KeyWicketIndex",
+                                   "DeathOversEconomy"]
+                fig_radar_bowl = create_radar_chart(adv_bowl, "Bowler", sel_bowl, metrics_bowling, "Bowling Radar")
+                if fig_radar_bowl:
+                    st.plotly_chart(fig_radar_bowl, use_container_width=True)
+
+    # RAW DATA
+    with tabs[3]:
+        st.subheader("Raw Data (with Enhanced Dynamic Pressure Score/Label)")
+        st.write(df_all.head(300))
 
 
 if __name__ == "__main__":
