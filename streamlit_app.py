@@ -1144,7 +1144,7 @@ def main():
         st.markdown("Match data in JSON format from the `data` directory.")
         st.markdown("---")
         st.caption("Version 1.0.0")
-        st.caption("© 2023 Cric Assist")
+        st.caption("© 2025 Cric Assist")
 
     st.markdown("# 🏏 Cric Assist Analytics")
 
