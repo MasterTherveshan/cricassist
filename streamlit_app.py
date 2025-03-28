@@ -361,6 +361,9 @@ def convert_match_json_to_ball_df(file_path):
     with open(file_path, "r") as f:
         match_data = json.load(f)
 
+    # Get team batting orders from the JSON players list
+    players_dict = match_data["info"].get("players", {})
+
     teams = match_data["info"].get("teams", [])
     match_type = match_data["info"].get("match_type", "T20")
     season = match_data["info"].get("season", "Unknown")
@@ -386,6 +389,9 @@ def convert_match_json_to_ball_df(file_path):
             bowling_team = [t for t in teams if t != batting_team][0]
         else:
             bowling_team = None
+
+        # Get the batting order for the team from the players list (if available)
+        batting_order = players_dict.get(batting_team, [])
 
         # Initialize trackers
         wickets_fallen = 0
@@ -508,6 +514,12 @@ def convert_match_json_to_ball_df(file_path):
                 striker_wicket = 1 if (striker_dismissed and mode_striker not in ["run out", "obstructing the field",
                                                                                   "retired hurt"]) else 0
 
+                # Infer batting position using the team's batting order
+                try:
+                    batting_position = batting_order.index(batter) + 1  # positions are 1-indexed
+                except ValueError:
+                    batting_position = 99
+
                 # Build the striker row (this row represents the delivery for the batter facing the ball)
                 row_striker = {
                     "Match_File": os.path.basename(file_path),
@@ -544,7 +556,8 @@ def convert_match_json_to_ball_df(file_path):
                     "BatterDismissed": 1 if striker_dismissed else 0,
                     "Mode_Of_Dismissal": mode_striker,
                     "PlayerDismissed": batter if striker_dismissed else None,
-                    "DeliveryType": "striker"
+                    "DeliveryType": "striker",
+                    "Batting_Position": batting_position
                 }
 
                 # Build the non-striker row (to capture run-out details etc.)
@@ -809,21 +822,26 @@ def compute_advanced_bowling_metrics(df):
     # Use only striker deliveries
     sub = df[df["DeliveryType"] == "striker"].dropna(subset=["Bowler"]).copy()
     sub["LegalDelivery"] = sub["IsLegalDelivery"]
+    # Updated key wicket logic:
     sub["KeyWicket"] = sub.apply(
-        lambda row: 1 if row["Wicket"] and (
-                (row["Match_Type"] == "T20" and row["Over"] < 10) or
-                (row["Match_Type"] != "T20" and row["Over"] < 20)
-        ) else 0, axis=1
+        lambda row: 1 if row["Wicket"] and (row.get("Mode_Of_Dismissal", "").lower() != "run out") and (
+            (row.get("Batting_Position", 99) <= 3) or
+            (((row.get("Batting_Position", 99) <= 6) and (row["Strike_Batsman_Runs"] > 10)) or
+             (row["Strike_Batsman_Runs"] > 30) or
+             (row["Current_Partnership"] > 30))
+        )
+        else 0,
+        axis=1
     )
     sub["DeathOver"] = sub.apply(
         lambda row: 1 if (
-                (row["Match_Type"] == "T20" and row["Over"] >= 15) or
-                (row["Match_Type"] != "T20" and row["Over"] >= 40)
+            (row["Match_Type"] == "T20" and row["Over"] >= 15) or
+            (row["Match_Type"] != "T20" and row["Over"] >= 40)
         ) else 0, axis=1
     )
     sub["PrevBallBoundary"] = sub["Previous_Ball_Result"] == "Boundary"
     sub["BounceBackSuccess"] = (sub["PrevBallBoundary"]) & (
-            (sub["Runs_Batter"] == 0) | (sub["Wicket"])
+        (sub["Runs_Batter"] == 0) | (sub["Wicket"])
     )
     grouped = sub.groupby("Bowler").agg(
         Balls=("LegalDelivery", "sum"),
@@ -1237,8 +1255,11 @@ def main():
             """)
             st.markdown("### Key Wicket Index (KWI)")
             st.markdown("""
-            Measures how many wickets a bowler takes in the first 10 overs, 
-            indicating early breakthrough ability. Higher KWI = more impact early.
+            Measures the impact of a bowler’s wicket-taking by flagging “key wickets” as those that either:
+            - Dismiss an opener (one of the first three batsmen), or 
+            - Remove a top-order batsman (batting position ≤ 6 with more than 10 runs)
+            - Or dismiss a batsman who has scored more than 30 runs
+            - Or break a partnership exceeding 30 runs
             """)
             st.markdown("### Death Overs Economy")
             st.markdown("""
