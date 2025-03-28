@@ -359,34 +359,33 @@ def is_legal_delivery(delivery):
 def convert_match_json_to_ball_df(file_path):
     with open(file_path, "r") as f:
         match_data = json.load(f)
+
     teams = match_data["info"].get("teams", [])
     match_type = match_data["info"].get("match_type", "T20")
     season = match_data["info"].get("season", "Unknown")
-    
-    # Extract match ID from filename (without extension)
-    match_id = os.path.basename(file_path).split('.')[0]
 
+    # Extract ID from filename
+    match_id = os.path.basename(file_path).split('.')[0]
     innings_list = match_data.get("innings", [])
     if not innings_list:
         return pd.DataFrame()
+
+    # For chase context
     first_inn_runs = 0
     if len(innings_list) >= 1:
         for over_dict in innings_list[0].get("overs", []):
             for delivery in over_dict.get("deliveries", []):
                 first_inn_runs += delivery.get("runs", {}).get("total", 0)
+
     ball_data = []
-    wickets_fallen = 0
-    current_partnership = 0
-    balls_since_boundary = 0
-    wickets_in_last_3_overs = 0
-    last_3_overs_balls = 0
-    prev_ball_result = None
-    bowler_current_wickets = {}
-    bowler_current_overs = {}
-    batsman_current_runs = {}
     for inn_idx, inn_data in enumerate(innings_list, start=1):
         batting_team = inn_data.get("team")
-        bowling_team = [t for t in teams if t != batting_team][0] if len(teams) > 1 else None
+        if len(teams) > 1:
+            bowling_team = [t for t in teams if t != batting_team][0]
+        else:
+            bowling_team = None
+
+        # Trackers
         wickets_fallen = 0
         current_partnership = 0
         balls_since_boundary = 0
@@ -394,91 +393,117 @@ def convert_match_json_to_ball_df(file_path):
         last_3_overs_balls = 0
         total_runs = 0
         legal_balls = 0
+        prev_ball_result = None
+        bowler_current_wickets = {}
+        bowler_current_overs = {}
+        batsman_current_runs = {}
+
         for over_dict in inn_data.get("overs", []):
-            over_num = over_dict.get("over", 0)
+            over_num = over_dict["over"]
             deliveries = over_dict.get("deliveries", [])
-            if match_type == "T20" and over_num >= 17:
-                last_3_overs_balls = 0
-            elif match_type != "T20" and over_num >= 47:
-                last_3_overs_balls = 0
+
+            # Reset if final overs
+            if match_type=="T20" and over_num>=17:
+                last_3_overs_balls=0
+            elif match_type!="T20" and over_num>=47:
+                last_3_overs_balls=0
+
             for ball_index, delivery in enumerate(deliveries):
-                total_runs += delivery.get("runs", {}).get("total", 0)
-                batter_runs = delivery.get("runs", {}).get("batter", 0)
+                total_runs += delivery["runs"]["total"]
+                batter_runs = delivery["runs"].get("batter", 0)
                 wicket_fell = bool(delivery.get("wickets"))
-                legal = is_legal_delivery(delivery)
-                if legal:
-                    legal_balls += 1
+
                 extras = delivery.get("extras", {})
+                is_legal = is_legal_delivery(delivery)
+                if is_legal:
+                    legal_balls += 1
+
+                # Striker faced ball if not wide
                 balls_faced = 1 if "wides" not in extras else 0
-                batting_delivery = 0
-                if "wides" not in extras:
-                    batting_delivery = 1
-                if (match_type == "T20" and over_num >= 17) or (match_type != "T20" and over_num >= 47):
-                    last_3_overs_balls += 1 if legal else 0
+                if (match_type=="T20" and over_num>=17) or (match_type!="T20" and over_num>=47):
+                    if is_legal:
+                        last_3_overs_balls+=1
                     if wicket_fell:
-                        wickets_in_last_3_overs += 1
-                if batter_runs in [4, 6]:
-                    balls_since_boundary = 0
+                        wickets_in_last_3_overs+=1
+
+                if batter_runs in [4,6]:
+                    balls_since_boundary=0
                 else:
-                    balls_since_boundary += 1 if legal else 0
+                    if is_legal:
+                        balls_since_boundary+=1
+
                 if wicket_fell:
-                    wickets_fallen += 1
-                    current_partnership = 0
+                    wickets_fallen+=1
+                    current_partnership=0
                 else:
-                    current_partnership += batter_runs
-                bowler = delivery.get("bowler")
+                    current_partnership+=batter_runs
+
+                bowler=delivery.get("bowler")
                 if bowler:
                     if bowler not in bowler_current_wickets:
-                        bowler_current_wickets[bowler] = 0
-                        bowler_current_overs[bowler] = 0
-                    if legal:
-                        bowler_current_overs[bowler] += 1
+                        bowler_current_wickets[bowler]=0
+                        bowler_current_overs[bowler]=0
+                    if is_legal:
+                        bowler_current_overs[bowler]+=1
                     if wicket_fell:
-                        bowler_current_wickets[bowler] += 1
+                        bowler_current_wickets[bowler]+=1
+
                 batter = delivery.get("batter")
-                if batter:
-                    if batter not in batsman_current_runs:
-                        batsman_current_runs[batter] = 0
-                    batsman_current_runs[batter] += batter_runs
-                overs_completed = legal_balls / 6.0
-                current_run_rate = total_runs / overs_completed if overs_completed > 0 else 0
-                required_run_rate = None
-                if inn_idx == 2:
-                    runs_needed = first_inn_runs - total_runs + 1
-                    balls_remaining = (20 if match_type == "T20" else 50) * 6 - legal_balls
-                    required_run_rate = (runs_needed / (balls_remaining / 6.0)) if balls_remaining > 0 else 0
-                if ball_index > 0 or over_num > 0:
+                non_striker = delivery.get("non_striker")
+
+                if batter not in batsman_current_runs:
+                    batsman_current_runs[batter]=0
+                batsman_current_runs[batter]+=batter_runs
+
+                overs_completed=legal_balls/6.0
+                current_run_rate = total_runs/overs_completed if overs_completed>0 else 0
+                required_run_rate=None
+                if inn_idx==2:
+                    runs_needed=first_inn_runs - total_runs + 1
+                    balls_left=(20 if match_type=="T20" else 50)*6 - legal_balls
+                    required_run_rate=(runs_needed/(balls_left/6.0)) if balls_left>0 else 0
+
+                # Basic result
+                if ball_index>0 or over_num>0:
                     if wicket_fell:
-                        this_ball_result = "Wicket"
-                    elif batter_runs == 0 and delivery.get("extras") is None:
-                        this_ball_result = "Dot"
-                    elif batter_runs in [4, 6]:
-                        this_ball_result = "Boundary"
-                    elif delivery.get("extras") is not None:
-                        this_ball_result = "Extra"
+                        this_ball_result="Wicket"
+                    elif batter_runs==0 and not extras:
+                        this_ball_result="Dot"
+                    elif batter_runs in [4,6]:
+                        this_ball_result="Boundary"
+                    elif extras:
+                        this_ball_result="Extra"
                     else:
-                        this_ball_result = str(batter_runs)
+                        this_ball_result=str(batter_runs)
                 else:
-                    this_ball_result = None
-                penalty_extras = extras.get("wides", 0) + extras.get("noballs", 0)
-                bowler_runs = delivery.get("runs", {}).get("batter", 0) + penalty_extras
-                row = {
+                    this_ball_result=None
+
+                penalty_extras = extras.get("wides", 0)+extras.get("noballs", 0)
+                bowler_runs = batter_runs + penalty_extras
+
+                # Determine who got out
+                wickets_info = delivery.get("wickets", [])
+                striker_dismissed = any(w.get("player_out")==batter for w in wickets_info)
+                non_striker_dismissed = any(w.get("player_out")==non_striker for w in wickets_info)
+
+                # Build row for the STRIKER
+                row_striker = {
                     "Match_File": os.path.basename(file_path),
                     "Season": season,
                     "Innings_Index": inn_idx,
                     "Batting_Team": batting_team,
                     "Bowling_Team": bowling_team,
-                    "Batter": delivery.get("batter"),
-                    "Non_Striker": delivery.get("non_striker"),
-                    "Bowler": delivery.get("bowler"),
+                    "Batter": batter,
+                    "Non_Striker": non_striker,
+                    "Bowler": bowler,
                     "Over": over_num,
-                    "Ball_In_Over": ball_index + 1,
-                    "Runs_Total": delivery.get("runs", {}).get("total", 0),
+                    "Ball_In_Over": ball_index+1,
+                    "Runs_Total": delivery["runs"]["total"],
                     "Runs_Batter": batter_runs,
                     "Bowler_Runs": bowler_runs,
-                    "Wicket": wicket_fell,
+                    "Wicket": 1 if wicket_fell else 0,
                     "Match_Type": match_type,
-                    "IsLegalDelivery": 1 if legal else 0,
+                    "IsLegalDelivery": 1 if is_legal else 0,
                     "IsBattingDelivery": balls_faced,
                     "Current_Score": f"{total_runs}-{wickets_fallen}",
                     "Wickets_Fallen": wickets_fallen,
@@ -488,55 +513,84 @@ def convert_match_json_to_ball_df(file_path):
                     "Balls_Since_Boundary": balls_since_boundary,
                     "Wickets_In_Last_3_Overs": wickets_in_last_3_overs,
                     "Previous_Ball_Result": prev_ball_result,
-                    "Bowler_Current_Wickets": bowler_current_wickets.get(bowler, 0),
-                    "Bowler_Current_Overs": bowler_current_overs.get(bowler, 0) / 6.0,
-                    "Strike_Batsman_Runs": batsman_current_runs.get(batter, 0),
-                    "Batting_Task": "Setting" if inn_idx == 1 else "Chasing",
-                    "Bowling_Task": "Bowling First" if inn_idx == 1 else "Defending",
-                    "Balls_Faced": balls_faced
+                    "Bowler_Current_Wickets": bowler_current_wickets.get(bowler,0) if bowler else 0,
+                    "Bowler_Current_Overs": bowler_current_overs.get(bowler,0)/6.0 if bowler else 0,
+                    "Strike_Batsman_Runs": batsman_current_runs[batter],
+                    "Batting_Task": "Setting" if inn_idx==1 else "Chasing",
+                    "Bowling_Task": "Bowling First" if inn_idx==1 else "Defending",
+                    "Balls_Faced": balls_faced,
+                    "BatterDismissed": 1 if striker_dismissed else 0
                 }
-                if wicket_fell and delivery.get("wickets"):
-                    row["Mode_Of_Dismissal"] = delivery.get("wickets")[0].get("kind", "Unknown")
+
+                if wicket_fell and wickets_info:
+                    row_striker["Mode_Of_Dismissal"] = wickets_info[0].get("kind","Unknown")
+                    row_striker["PlayerDismissed"] = wickets_info[0].get("player_out")
                 else:
-                    row["Mode_Of_Dismissal"] = None
-                prev_ball_result = this_ball_result
-                ball_data.append(row)
+                    row_striker["Mode_Of_Dismissal"] = None
+                    row_striker["PlayerDismissed"] = None
+
+                ball_data.append(row_striker)
+
+                # Build row for the NON-STRIKER to capture run-outs, etc.
+                row_non_striker = row_striker.copy()
+                row_non_striker["Batter"] = non_striker
+                row_non_striker["Balls_Faced"] = 0       # non-striker isn't facing
+                row_non_striker["Runs_Batter"] = 0
+                row_non_striker["IsBattingDelivery"] = 0
+                row_non_striker["Strike_Batsman_Runs"] = 0
+                row_non_striker["BatterDismissed"] = 1 if non_striker_dismissed else 0
+                # If the non-striker was run out, set their dismissal mode:
+                row_non_striker["Mode_Of_Dismissal"] = None
+                row_non_striker["PlayerDismissed"] = None
+                if non_striker_dismissed and wickets_info:
+                    for w in wickets_info:
+                        if w["player_out"] == non_striker:
+                            row_non_striker["Mode_Of_Dismissal"] = w.get("kind","Unknown")
+                            row_non_striker["PlayerDismissed"] = non_striker
+                            break
+
+                ball_data.append(row_non_striker)
+                prev_ball_result=this_ball_result
+
     df = pd.DataFrame(ball_data)
     if df.empty:
         return df
 
+    # Label game phase
     def game_phase_t20(over):
-        if over < 6:
+        if over<6:
             return "Powerplay"
-        elif over < 16:
+        elif over<16:
             return "Middle"
         else:
             return "Death"
 
     def game_phase_50(over):
-        if over < 10:
+        if over<10:
             return "Powerplay"
-        elif over < 40:
+        elif over<40:
             return "Middle"
         else:
             return "Death"
 
-    if match_type == "T20":
+    if match_type=="T20":
         df["Game_Phase"] = df["Over"].apply(game_phase_t20)
     else:
         df["Game_Phase"] = df["Over"].apply(game_phase_50)
-    phase_map = {"Powerplay": "Low", "Middle": "Medium", "Death": "High"}
-    df["Pressure"] = df["Game_Phase"].map(phase_map)
-    out_chunks = []
-    for (mf, idx), chunk in df.groupby(["Match_File", "Innings_Index"]):
-        chunk = chunk.copy()
-        if idx == 2:
-            chunk = calculate_dynamic_pressure_for_innings(chunk, first_innings_total=first_inn_runs)
+
+    phase_map={"Powerplay":"Low","Middle":"Medium","Death":"High"}
+    df["Pressure"]=df["Game_Phase"].map(phase_map)
+
+    # Add dynamic pressure
+    out_chunks=[]
+    for (mf, idx), chunk in df.groupby(["Match_File","Innings_Index"]):
+        chunk=chunk.copy()
+        if idx==2:
+            chunk=calculate_dynamic_pressure_for_innings(chunk,first_innings_total=first_inn_runs)
         else:
-            chunk = calculate_dynamic_pressure_for_innings(chunk, first_innings_total=None)
+            chunk=calculate_dynamic_pressure_for_innings(chunk,first_innings_total=None)
         out_chunks.append(chunk)
     return pd.concat(out_chunks, ignore_index=True)
-
 
 ############################################
 # 4) GAMES PLAYED HELPERS
@@ -570,7 +624,7 @@ def compute_batting_metrics_by_pressure(df, pressure_col="DynamicPressureLabel")
     grouped = sub.groupby(["Batter", pressure_col], dropna=True).agg(
         Runs=("Runs_Batter", "sum"),
         Balls=("Balls_Faced", "sum"),
-        Dismissals=("Wicket", "sum"),
+        Dismissals=("BatterDismissed", "sum"),
         Dots=("DotBall", "sum")
     ).reset_index()
     grouped["StrikeRate"] = grouped.apply(
@@ -612,86 +666,104 @@ def compute_bowling_metrics_by_pressure(df, pressure_col="DynamicPressureLabel")
 # 6) ADVANCED BATTING + BOWLING
 ############################################
 def compute_overall_batting_metrics(df):
-    """Compute batting metrics across all matches"""
+    """Compute batting metrics across all matches with correct dismissal tracking"""
     if df.empty:
         return pd.DataFrame()
-    
-    # Group by batter and compute metrics
-    batting = df.dropna(subset=["Batter"])
-    grouped = batting.groupby("Batter").agg(
+
+    # First, identify unique innings per batsman
+    # Only count when the batter themselves was dismissed
+    innings_data = df.dropna(subset=["Batter"]).groupby(["Match_File", "Innings_Index", "Batter"]).agg(
         Runs=("Runs_Batter", "sum"),
-        Balls=("IsBattingDelivery", "sum"),  # Use IsBattingDelivery instead of IsLegalDelivery
+        Was_Dismissed=("BatterDismissed", "max")  # Only count dismissals if the actual batter was out
+    ).reset_index()
+
+    # Now aggregate across all innings for each batter
+    grouped = innings_data.groupby("Batter").agg(
+        Innings=("Match_File", "count"),  # Total innings played
+        Dismissals=("Was_Dismissed", "sum"),  # Only counts innings where the batter was dismissed
+        Total_Runs=("Runs", "sum")  # Total runs scored
+    ).reset_index()
+
+    # Get ball-by-ball stats for strike rate
+    ball_stats = df.dropna(subset=["Batter"]).groupby("Batter").agg(
+        Balls=("IsBattingDelivery", "sum"),
         Boundaries_4s=("Runs_Batter", lambda x: (x == 4).sum()),
         Boundaries_6s=("Runs_Batter", lambda x: (x == 6).sum()),
-        Outs=("Wicket", "sum"),  # Count ALL dismissals for batting average
     ).reset_index()
-    
-    # Calculate strike rate and average
-    grouped["StrikeRate"] = (grouped["Runs"] / grouped["Balls"]) * 100
-    grouped["Average"] = grouped.apply(lambda x: x["Runs"] / x["Outs"] if x["Outs"] > 0 else float('inf'), axis=1)
-    grouped["Boundary_Rate"] = ((grouped["Boundaries_4s"] + grouped["Boundaries_6s"]) / grouped["Balls"]) * 100
-    
-    # Sort by runs
-    return grouped.sort_values("Runs", ascending=False)
+
+    # Merge the data
+    final = grouped.merge(ball_stats, on="Batter", how="left")
+
+    # Calculate metrics
+    final["Average"] = final.apply(lambda x: x["Total_Runs"] / x["Dismissals"] if x["Dismissals"] > 0 else float('inf'),
+                                   axis=1)
+    final["StrikeRate"] = (final["Total_Runs"] / final["Balls"]) * 100
+    final["Boundary_Rate"] = ((final["Boundaries_4s"] + final["Boundaries_6s"]) / final["Balls"]) * 100
+    final["NotOuts"] = final["Innings"] - final["Dismissals"]
+
+    # Rename to match expected columns
+    final = final.rename(columns={"Total_Runs": "Runs"})
+
+    return final.sort_values("Runs", ascending=False)
 
 
 def compute_advanced_batting_metrics(df):
     """Compute advanced batting metrics"""
     if df.empty:
         return pd.DataFrame()
-    
+
     # Get basic batting stats
     batters = df[df["Batter"].notna()]["Batter"].unique()
     metrics = []
-    
+
     for batter in batters:
         batter_df = df[df["Batter"] == batter]
-        
-        # Get basic stats
+
+        # Basic stats
         runs = batter_df["Runs_Batter"].sum()
-        balls = batter_df["IsBattingDelivery"].sum()  # Use IsBattingDelivery
-        outs = batter_df["Wicket"].sum()
-        
-        # Skip batters with very few balls
+        balls = batter_df["IsBattingDelivery"].sum()
+        outs = batter_df["BatterDismissed"].sum()
+
+        # Skip batters with minimal balls
         if balls < 10:
             continue
-            
-        # Calculate basic metrics
+
+        # Averages, Strike Rates
         avg = runs / outs if outs > 0 else float('inf')
         sr = (runs / balls) * 100 if balls > 0 else 0
-        
-        # Calculate boundary rate
+
+        # Boundary rate
         boundaries = ((batter_df["Runs_Batter"] == 4) | (batter_df["Runs_Batter"] == 6)).sum()
         boundary_rate = boundaries / balls if balls > 0 else 0
-        
-        # Calculate dot ball percentage (excluding wides)
+
+        # Dot ball %
         dots = ((batter_df["Runs_Batter"] == 0) & (batter_df["IsBattingDelivery"] == 1)).sum()
         dot_pct = dots / balls if balls > 0 else 0
-        
-        # Strike rotation (1s and 2s)
+
+        # Strike rotation
         ones_and_twos = ((batter_df["Runs_Batter"] == 1) | (batter_df["Runs_Batter"] == 2)).sum()
         strike_rotation = ones_and_twos / balls if balls > 0 else 0
-        
-        # Finisher metric (not out percentage)
+
+        # Finisher metric (not out %)
         if "Match_File_Path" in batter_df.columns:
             innings = len(batter_df.groupby(["Match_File_Path", "Innings_Index"]))
         elif "Match_File" in batter_df.columns:
             innings = len(batter_df.groupby(["Match_File", "Innings_Index"]))
         else:
-            # If neither column exists, approximate innings count
-            innings = outs + 1  # Rough approximation
-            
+            innings = outs + 1  # Rough fallback
+
         not_outs = innings - outs
         finisher = not_outs / innings if innings > 0 else 0
-        
+
         # Pressure performance
         high_pressure = batter_df[batter_df["DynamicPressureLabel"].isin(["High", "Extreme"])]
         if not high_pressure.empty and high_pressure[high_pressure["IsLegalDelivery"] == 1].shape[0] >= 10:
-            pressure_sr = (high_pressure["Runs_Batter"].sum() / high_pressure[high_pressure["IsLegalDelivery"] == 1].shape[0]) * 100
+            pressure_sr = (high_pressure["Runs_Batter"].sum() /
+                           high_pressure[high_pressure["IsLegalDelivery"] == 1].shape[0]) * 100
         else:
             pressure_sr = 0
         pressure_index = pressure_sr / sr if sr > 0 else 0
-        
+
         metrics.append({
             "Batter": batter,
             "Total_Runs": runs,
@@ -703,7 +775,7 @@ def compute_advanced_batting_metrics(df):
             "Finisher": finisher,
             "PressurePerformanceIndex": pressure_index
         })
-    
+
     return pd.DataFrame(metrics)
 
 
@@ -777,30 +849,37 @@ def create_radar_chart(df, player_col, player_list, metrics, title):
     sub = df[df[player_col].isin(player_list)].copy()
     if sub.empty:
         return None
+
+    # Metrics to invert
     invert_metrics = []
     if player_col == "Batter":
         invert_metrics = ["DotBallPct"]
     elif player_col == "Bowler":
         invert_metrics = ["Economy", "StrikeRate", "DeathOversEconomy"]
+
     clipped_rows = []
     for _, row in sub.iterrows():
         player_name = row[player_col]
         data_row = {"player": player_name}
         for m in metrics:
             val_raw = row[m]
+            # Calculate clipped ranges
             low_ = df[m].quantile(0.05)
             high_ = df[m].quantile(0.95)
             val_clipped = np.clip(val_raw, low_, high_)
             min_ = df[m].clip(low_, high_).min()
             max_ = df[m].clip(low_, high_).max()
             rng = max_ - min_ if max_ > min_ else 1e-9
+
             if m in invert_metrics:
                 val_scaled = 1 - ((val_clipped - min_) / rng)
             else:
                 val_scaled = (val_clipped - min_) / rng
+
             data_row[m] = val_scaled
             data_row[f"{m}_original"] = val_raw
         clipped_rows.append(data_row)
+
     radar_data = []
     for row in clipped_rows:
         for m in metrics:
@@ -812,15 +891,19 @@ def create_radar_chart(df, player_col, player_list, metrics, title):
                 "Better": "Lower" if m in invert_metrics else "Higher"
             })
     radar_df = pd.DataFrame(radar_data)
+
     radar_df["OriginalFormatted"] = radar_df.apply(
         lambda x: f"{x['Original']:.2f}" if isinstance(x['Original'], (int, float)) else str(x['Original']),
         axis=1
     )
     radar_df["HoverText"] = radar_df.apply(
-        lambda
-            x: f"{x['player']}<br>{x['Metric']}: {x['OriginalFormatted']}<br>({'Lower is better' if x['Better'] == 'Lower' else 'Higher is better'})",
+        lambda x: (
+            f"{x['player']}<br>{x['Metric']}: {x['OriginalFormatted']}"
+            f"<br>({'Lower is better' if x['Better'] == 'Lower' else 'Higher is better'})"
+        ),
         axis=1
     )
+
     fig = px.line_polar(
         radar_df,
         r="Value",
@@ -892,7 +975,8 @@ def display_metric_card(title, value, description=None):
     <div class="metric-card">
         <div class="metric-title">{title}</div>
         <div class="metric-value">{value}</div>
-        {f'<div style="color: #B0B0B0; font-size: 0.8rem; margin-top: 0.3rem;">{description}</div>' if description else ''}
+        {f'<div style="color: #B0B0B0; font-size: 0.8rem; margin-top: 0.3rem;' +
+         f'">{description}</div>' if description else ''}
     </div>
     """
     st.markdown(html, unsafe_allow_html=True)
@@ -938,21 +1022,25 @@ def display_performance_insights(df):
                         best_sr = qualified.sort_values("StrikeRate", ascending=False).head(3)
                         for i, row in best_sr.iterrows():
                             st.markdown(
-                                f"**{row['Batter']}**: <span style='color:#4FD1C5; font-weight:bold;'>{row['StrikeRate']:.2f}</span> SR ({row['Runs']} runs from {row['Balls']} balls)",
-                                unsafe_allow_html=True)
+                                f"**{row['Batter']}**: <span style='color:#4FD1C5; font-weight:bold;'>"
+                                f"{row['StrikeRate']:.2f}</span> SR ({row['Runs']} runs from {row['Balls']} balls)",
+                                unsafe_allow_html=True
+                            )
                     batters_with_both = set(bat_pressure[bat_pressure["DynamicPressureLabel"] == "Low"]["Batter"]) & \
                                         set(bat_pressure[
-                                                bat_pressure["DynamicPressureLabel"].isin(["High", "Extreme"])][
-                                                "Batter"])
+                                                bat_pressure["DynamicPressureLabel"].isin(["High", "Extreme"])]
+                                            ["Batter"])
                     if batters_with_both:
                         pressure_impact = []
                         for batter in batters_with_both:
                             low_data = bat_pressure[
                                 (bat_pressure["Batter"] == batter) & (bat_pressure["DynamicPressureLabel"] == "Low")]
-                            high_data = bat_pressure[(bat_pressure["Batter"] == batter) & (
-                                bat_pressure["DynamicPressureLabel"].isin(["High", "Extreme"]))]
-                            if not low_data.empty and not high_data.empty and low_data["Balls"].iloc[0] >= 20 and \
-                                    high_data["Balls"].iloc[0] >= 20:
+                            high_data = bat_pressure[
+                                (bat_pressure["Batter"] == batter) &
+                                (bat_pressure["DynamicPressureLabel"].isin(["High", "Extreme"]))
+                                ]
+                            if not low_data.empty and not high_data.empty \
+                                    and low_data["Balls"].iloc[0] >= 20 and high_data["Balls"].iloc[0] >= 20:
                                 low_sr = low_data["StrikeRate"].iloc[0]
                                 high_sr = high_data["StrikeRate"].iloc[0]
                                 impact = (high_sr - low_sr) / low_sr * 100
@@ -970,15 +1058,21 @@ def display_performance_insights(df):
                                 for i, row in improvers.iterrows():
                                     if row["Impact"] > 0:
                                         st.markdown(
-                                            f"**{row['Batter']}**: <span style='color:#4FD1C5; font-weight:bold;'>+{row['Impact']:.1f}%</span> SR increase ({row['Low_SR']:.2f} → {row['High_SR']:.2f})",
-                                            unsafe_allow_html=True)
+                                            f"**{row['Batter']}**: "
+                                            f"<span style='color:#4FD1C5; font-weight:bold;'>+{row['Impact']:.1f}%</span>"
+                                            f" SR increase ({row['Low_SR']:.2f} → {row['High_SR']:.2f})",
+                                            unsafe_allow_html=True
+                                        )
                                 st.markdown('**Players who struggle under pressure:**')
                                 strugglers = impact_df.sort_values("Impact").head(3)
                                 for i, row in strugglers.iterrows():
                                     if row["Impact"] < 0:
                                         st.markdown(
-                                            f"**{row['Batter']}**: <span style='color:#F87171; font-weight:bold;'>{row['Impact']:.1f}%</span> SR decrease ({row['Low_SR']:.2f} → {row['High_SR']:.2f})",
-                                            unsafe_allow_html=True)
+                                            f"**{row['Batter']}**: "
+                                            f"<span style='color:#F87171; font-weight:bold;'>{row['Impact']:.1f}%</span>"
+                                            f" SR decrease ({row['Low_SR']:.2f} → {row['High_SR']:.2f})",
+                                            unsafe_allow_html=True
+                                        )
     with col2:
         st.markdown("### Bowling Under Pressure")
         bowl_pressure = compute_bowling_metrics_by_pressure(df, pressure_col="DynamicPressureLabel")
@@ -993,14 +1087,19 @@ def display_performance_insights(df):
                         best_economy = qualified.sort_values("Economy").head(3)
                         for i, row in best_economy.iterrows():
                             st.markdown(
-                                f"**{row['Bowler']}**: <span style='color:#4FD1C5; font-weight:bold;'>{row['Economy']:.2f}</span> RPO ({row['Wickets']} wickets from {row['Balls'] / 6:.1f} overs)",
-                                unsafe_allow_html=True)
+                                f"**{row['Bowler']}**: <span style='color:#4FD1C5; font-weight:bold;'>"
+                                f"{row['Economy']:.2f}</span> RPO ({row['Wickets']} wickets "
+                                f"from {row['Balls'] / 6:.1f} overs)",
+                                unsafe_allow_html=True
+                            )
                     with st.expander("Best Wicket-Takers Under High Pressure", expanded=True):
                         best_wickets = qualified.sort_values(["Wickets", "Economy"], ascending=[False, True]).head(3)
                         for i, row in best_wickets.iterrows():
                             st.markdown(
-                                f"**{row['Bowler']}**: <span style='color:#4FD1C5; font-weight:bold;'>{row['Wickets']}</span> wickets at {row['Economy']:.2f} economy",
-                                unsafe_allow_html=True)
+                                f"**{row['Bowler']}**: <span style='color:#4FD1C5; font-weight:bold;'>"
+                                f"{row['Wickets']}</span> wickets at {row['Economy']:.2f} economy",
+                                unsafe_allow_html=True
+                            )
                     adv_bowl = compute_advanced_bowling_metrics(df)
                     if not adv_bowl.empty:
                         qualified_bowlers = qualified["Bowler"].unique()
@@ -1011,8 +1110,10 @@ def display_performance_insights(df):
                                                                                     ascending=False).head(3)
                                 for i, row in top_bounce_back.iterrows():
                                     st.markdown(
-                                        f"**{row['Bowler']}**: <span style='color:#4FD1C5; font-weight:bold;'>{row['BounceBackRate'] * 100:.1f}%</span> bounce back rate",
-                                        unsafe_allow_html=True)
+                                        f"**{row['Bowler']}**: <span style='color:#4FD1C5; font-weight:bold;'>"
+                                        f"{row['BounceBackRate'] * 100:.1f}%</span> bounce back rate",
+                                        unsafe_allow_html=True
+                                    )
 
 
 def main():
@@ -1023,6 +1124,8 @@ def main():
         initial_sidebar_state="expanded"
     )
     inject_custom_css()
+
+    # Sidebar
     with st.sidebar:
         col1, col2 = st.columns([1, 3])
         with col1:
@@ -1042,13 +1145,18 @@ def main():
         st.markdown("---")
         st.caption("Version 1.0.0")
         st.caption("© 2023 Cric Assist")
+
     st.markdown("# 🏏 Cric Assist Analytics")
+
+    # Load data
     with st.spinner("Loading and processing cricket match data..."):
         df_all = load_and_combine_data("data")
     if df_all.empty:
         st.error("### No data found")
         st.markdown("Please place your JSON files in the 'data' folder.")
         return
+
+    # Top metrics
     with st.container():
         st.markdown("## Key Metrics & Filters")
         match_count = df_all["Match_File"].nunique()
@@ -1060,9 +1168,11 @@ def main():
             display_metric_card("Players", f"{player_count:,}", "Total unique players")
         with col3:
             display_metric_card("Data Points", f"{len(df_all):,}", "Ball-by-ball records")
+
         st.markdown("### Data Filters")
         create_helper_text(
-            "Use these filters to narrow down the analysis to specific seasons or players with a minimum number of games")
+            "Use these filters to narrow down the analysis to specific seasons or players with a minimum number of games"
+        )
         col1, col2 = st.columns([2, 1])
         with col1:
             seasons = sorted(df_all["Season"].dropna().unique().tolist())
@@ -1072,16 +1182,18 @@ def main():
         with col2:
             min_games = st.number_input("Minimum Games Played", min_value=1, value=3,
                                         help="Only include players who have played at least this many games")
+
     if df_all.empty:
         st.warning("No data remains after applying filters.")
         return
+
+    # Explanation of metrics
     with st.expander("Understanding Cricket Metrics", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("### Dynamic Pressure")
             st.markdown("""
             Measures how stressful the game situation is, considering:
-
             - Match innings (1st or 2nd)
             - Expected vs. actual run rates (1st innings)
             - Run chase difficulty (2nd innings)
@@ -1092,31 +1204,35 @@ def main():
             """)
             st.markdown("### Finisher Rate")
             st.markdown("""
-            The percentage of innings where a batter remains not out, reflecting their ability to "finish" an innings.
-            Higher is better for middle/lower order batters.
+            The percentage of innings where a batter remains not out, reflecting 
+            their ability to "finish" an innings. Higher is better for middle/lower order batters.
             """)
         with col2:
             st.markdown("### Bounce Back Rate (BBR)")
             st.markdown("""
-            For bowlers, after conceding a boundary, how often do they respond with a dot ball or wicket on the next delivery?
-            Higher BBR = better recovery after being hit.
+            For bowlers, after conceding a boundary, how often do they respond with a 
+            dot ball or wicket on the next delivery? Higher BBR = better recovery after being hit.
             """)
             st.markdown("### Key Wicket Index (KWI)")
             st.markdown("""
-            Measures how many wickets a bowler takes in the first 10 overs, indicating early breakthrough ability.
-            Higher KWI = more impact in early innings.
+            Measures how many wickets a bowler takes in the first 10 overs, 
+            indicating early breakthrough ability. Higher KWI = more impact early.
             """)
             st.markdown("### Death Overs Economy")
             st.markdown("""
-            Economy rate specifically in the final overs (16–20) when batting acceleration typically occurs.
-            Lower = better performance under pressure.
+            Economy rate specifically in the final overs (16–20) when batting acceleration 
+            typically occurs. Lower = better performance at the death.
             """)
+
+    # Tabs
     tabs = st.tabs([
         "📊 Batting - Dynamic Pressure",
         "🎯 Bowling - Dynamic Pressure",
         "📈 Advanced Metrics + Radar",
         "🔍 Raw Data Preview"
     ])
+
+    # 1) Batting: Dynamic Pressure
     with tabs[0]:
         st.markdown("## Batting Performance Under Pressure")
         create_helper_text("Analyze how batters perform under different levels of match pressure")
@@ -1135,11 +1251,17 @@ def main():
                     all_batters = sorted(merged_bat["Batter"].unique().tolist())
                     default_batters = get_default_batters_pressure(merged_bat, n=5)
                     st.markdown("### Select Batters to Compare")
-                    selected_batters = st.multiselect("", all_batters, default=default_batters,
-                                                      help="Select up to 5 batters for best visualization results")
+                    selected_batters = st.multiselect(
+                        "",
+                        all_batters,
+                        default=default_batters,
+                        help="Select up to 5 batters for best visualization"
+                    )
                 with col2:
                     create_insight_banner(
-                        "Compare how strike rates and dot ball percentages change under different pressure situations.")
+                        "Compare how strike rates and dot ball percentages change under different pressure situations."
+                    )
+
                 if selected_batters:
                     sub_bat = merged_bat[merged_bat["Batter"].isin(selected_batters)]
                     st.markdown("### Performance Metrics by Pressure Level")
@@ -1154,6 +1276,7 @@ def main():
                     )
                     display_df = display_df.sort_values("DynamicPressureLabel")
                     st.dataframe(display_df, use_container_width=True)
+
                     st.markdown("### Strike Rate Comparison")
                     sub_bat["DynamicPressureLabel"] = pd.Categorical(
                         sub_bat["DynamicPressureLabel"],
@@ -1187,6 +1310,7 @@ def main():
                         margin=dict(l=10, r=10, t=50, b=10)
                     )
                     st.plotly_chart(fig_bat, use_container_width=True)
+
                     st.markdown("### Dot Ball Percentage Comparison")
                     fig_bat2 = px.bar(
                         sub_bat,
@@ -1217,6 +1341,8 @@ def main():
                     st.plotly_chart(fig_bat2, use_container_width=True)
                 else:
                     st.info("Please select at least one batter to display charts.")
+
+    # 2) Bowling: Dynamic Pressure
     with tabs[1]:
         st.markdown("## Bowling Performance Under Pressure")
         create_helper_text("Analyze how bowlers perform under different levels of match pressure")
@@ -1235,11 +1361,17 @@ def main():
                     all_bowlers = sorted(merged_bowl["Bowler"].unique().tolist())
                     default_bowlers = get_default_bowlers_pressure(merged_bowl, n=5)
                     st.markdown("### Select Bowlers to Compare")
-                    selected_bowlers = st.multiselect("", all_bowlers, default=default_bowlers,
-                                                      help="Select up to 5 bowlers for best visualization results")
+                    selected_bowlers = st.multiselect(
+                        "",
+                        all_bowlers,
+                        default=default_bowlers,
+                        help="Select up to 5 bowlers for best visualization"
+                    )
                 with col2:
                     create_insight_banner(
-                        "Compare how economy rates and dot ball percentages change under different pressure situations.")
+                        "Compare how economy rates and dot ball percentages change under different pressure situations."
+                    )
+
                 if selected_bowlers:
                     sub_bowl = merged_bowl[merged_bowl["Bowler"].isin(selected_bowlers)]
                     st.markdown("### Performance Metrics by Pressure Level")
@@ -1254,6 +1386,7 @@ def main():
                     )
                     display_df = display_df.sort_values("DynamicPressureLabel")
                     st.dataframe(display_df, use_container_width=True)
+
                     st.markdown("### Economy Rate Comparison")
                     sub_bowl["DynamicPressureLabel"] = pd.Categorical(
                         sub_bowl["DynamicPressureLabel"],
@@ -1287,6 +1420,7 @@ def main():
                         margin=dict(l=10, r=10, t=50, b=10)
                     )
                     st.plotly_chart(fig_bowl, use_container_width=True)
+
                     st.markdown("### Dot Ball Percentage Comparison")
                     fig_bowl2 = px.bar(
                         sub_bowl,
@@ -1317,9 +1451,12 @@ def main():
                     st.plotly_chart(fig_bowl2, use_container_width=True)
                 else:
                     st.info("Please select at least one bowler to display charts.")
+
+    # 3) Advanced metrics + Radar
     with tabs[2]:
         st.markdown("## Advanced Metrics & Radar Charts")
         create_helper_text("Compare players using multiple performance dimensions in radar charts")
+
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("### Batting Advanced Metrics")
@@ -1340,11 +1477,16 @@ def main():
                 display_bat["StrikeRotationEfficiency"] = (display_bat["StrikeRotationEfficiency"] * 100).round(
                     1).astype(str) + '%'
                 st.dataframe(display_bat, use_container_width=True)
+
                 all_bat = sorted(adv_bat["Batter"].unique().tolist())
                 default_batters_adv = get_default_batters_adv(adv_bat, n=3)
                 st.markdown("### Select Batters for Radar")
-                sel_bat = st.multiselect("Choose up to 5 batters", all_bat, default=default_batters_adv,
-                                         help="Radar chart works best with 3-5 players")
+                sel_bat = st.multiselect(
+                    "Choose up to 5 batters",
+                    all_bat,
+                    default=default_batters_adv,
+                    help="Radar chart works best with 3-5 players"
+                )
                 if sel_bat:
                     metrics_batting = ["Total_Runs", "Average", "StrikeRate", "Finisher",
                                        "BoundaryRate", "StrikeRotationEfficiency", "PressurePerformanceIndex"]
@@ -1352,13 +1494,12 @@ def main():
                         st.markdown("""
                         - **Total_Runs**: Total runs scored
                         - **Average**: Batting average (runs per dismissal)
-                        - **StrikeRate**: Runs scored per 100 balls faced
-                        - **Finisher**: Percentage of innings where batter remains not out
-                        - **BoundaryRate**: Percentage of balls faced that result in boundaries (4s & 6s)
-                        - **StrikeRotationEfficiency**: Ability to rotate strike (% of balls not played as dots)
-                        - **PressurePerformanceIndex**: Strike rate during high pressure situations
-
-                        > **Note:** All metrics are oriented so that higher values (outward extension) represent better performance.
+                        - **StrikeRate**: Runs per 100 balls
+                        - **Finisher**: % of innings where batter remains not out
+                        - **BoundaryRate**: % of balls faced that result in boundaries
+                        - **StrikeRotationEfficiency**: (1 - dot ball pct)
+                        - **PressurePerformanceIndex**: Strike rate in High/Extreme pressure, normalized
+                        > **Note:** All metrics scale so that outward is "better."
                         """)
                     fig_radar_bat = create_radar_chart(adv_bat, "Batter", sel_bat, metrics_batting,
                                                        "Batting Comparison")
@@ -1367,19 +1508,15 @@ def main():
                             template="plotly_dark",
                             polar=dict(
                                 bgcolor="#272D3F",
-                                angularaxis=dict(
-                                    linewidth=1,
-                                    linecolor='#3A4566'
-                                ),
-                                radialaxis=dict(
-                                    gridcolor='#3A4566'
-                                )
+                                angularaxis=dict(linewidth=1, linecolor='#3A4566'),
+                                radialaxis=dict(gridcolor='#3A4566')
                             ),
                             paper_bgcolor="#1E2130",
                             font=dict(color="#E6E6E6"),
                             margin=dict(l=80, r=80, t=50, b=50)
                         )
                         st.plotly_chart(fig_radar_bat, use_container_width=True)
+
         with col2:
             st.markdown("### Bowling Advanced Metrics")
             adv_bowl = compute_advanced_bowling_metrics(df_all)
@@ -1390,31 +1527,34 @@ def main():
                 st.info("No bowlers meet the minimum games criteria.")
             else:
                 display_bowl = adv_bowl.copy()
-                for col in ["Economy", "StrikeRate", "DeathOversEconomy"]:
-                    display_bowl[col] = display_bowl[col].round(2)
+                for col_ in ["Economy", "StrikeRate", "DeathOversEconomy"]:
+                    display_bowl[col_] = display_bowl[col_].round(2)
                 display_bowl["BounceBackRate"] = (display_bowl["BounceBackRate"] * 100).round(1).astype(str) + '%'
                 display_bowl["KeyWicketIndex"] = (display_bowl["KeyWicketIndex"] * 100).round(1).astype(str) + '%'
                 st.dataframe(display_bowl, use_container_width=True)
+
                 all_bowl = sorted(adv_bowl["Bowler"].unique().tolist())
                 default_bowlers_adv = get_default_bowlers_adv(adv_bowl, n=3)
                 st.markdown("### Select Bowlers for Radar")
-                sel_bowl = st.multiselect("Choose up to 5 bowlers", all_bowl, default=default_bowlers_adv,
-                                          help="Radar chart works best with 3-5 players")
+                sel_bowl = st.multiselect(
+                    "Choose up to 5 bowlers",
+                    all_bowl,
+                    default=default_bowlers_adv,
+                    help="Radar chart works best with 3-5 players"
+                )
                 if sel_bowl:
                     metrics_bowling = ["Wickets", "Economy", "StrikeRate", "BounceBackRate", "KeyWicketIndex",
                                        "DeathOversEconomy"]
                     with st.expander("Understanding the Radar Axes", expanded=False):
                         st.markdown("""
                         - **Wickets**: Total wickets taken
-                        - **Economy**: Runs conceded per over (lower is better)
-                        - **StrikeRate**: Balls bowled per wicket (lower is better)
-                        - **BounceBackRate**: Recovery rate after being hit for a boundary
-                        - **KeyWicketIndex**: Proportion of wickets taken in first 10 overs
-                        - **DeathOversEconomy**: Economy rate in overs 16-20 (lower is better)
-                        """)
-                        st.markdown("""
-                        > **Note**: For Economy, StrikeRate, and DeathOversEconomy, the scales are inverted in the radar chart 
-                        > (lower values shown as higher on chart) because lower values are better for these metrics.
+                        - **Economy**: Runs per over (lower = better)
+                        - **StrikeRate**: Balls per wicket (lower = better)
+                        - **BounceBackRate**: Recovery after a boundary
+                        - **KeyWicketIndex**: Proportion of wickets in first 10 overs
+                        - **DeathOversEconomy**: Economy from overs 16–20
+                        > **Note**: For Economy, StrikeRate, and DeathOversEconomy, 
+                        > lower is better; those are inverted on the chart.
                         """)
                     fig_radar_bowl = create_radar_chart(adv_bowl, "Bowler", sel_bowl, metrics_bowling,
                                                         "Bowling Comparison")
@@ -1423,26 +1563,22 @@ def main():
                             template="plotly_dark",
                             polar=dict(
                                 bgcolor="#272D3F",
-                                angularaxis=dict(
-                                    linewidth=1,
-                                    linecolor='#3A4566'
-                                ),
-                                radialaxis=dict(
-                                    gridcolor='#3A4566'
-                                )
+                                angularaxis=dict(linewidth=1, linecolor='#3A4566'),
+                                radialaxis=dict(gridcolor='#3A4566')
                             ),
                             paper_bgcolor="#1E2130",
                             font=dict(color="#E6E6E6"),
                             margin=dict(l=80, r=80, t=50, b=50)
                         )
                         st.plotly_chart(fig_radar_bowl, use_container_width=True)
+
+    # 4) Raw Data Explorer
     with tabs[3]:
         st.markdown("## Raw Data Explorer")
         create_helper_text("View and filter the underlying ball-by-ball data")
         with st.expander("About the Raw Data", expanded=False):
             st.markdown("""
             This table shows the ball-by-ball data from all matches, including:
-
             - Match details (file, season, innings)
             - Teams and players involved
             - Ball details (over, ball in over)
@@ -1454,7 +1590,8 @@ def main():
         col1, col2, col3 = st.columns(3)
         with col1:
             teams = sorted(
-                list(set(df_all["Batting_Team"].dropna().tolist() + df_all["Bowling_Team"].dropna().tolist())))
+                list(set(df_all["Batting_Team"].dropna().tolist() + df_all["Bowling_Team"].dropna().tolist()))
+            )
             selected_team = st.selectbox("Filter by Team", ["All Teams"] + teams)
         with col2:
             phases = sorted(df_all["Game_Phase"].dropna().unique().tolist())
@@ -1462,18 +1599,22 @@ def main():
         with col3:
             pressures = sorted(df_all["DynamicPressureLabel"].dropna().unique().tolist())
             selected_pressure = st.selectbox("Filter by Pressure Level", ["All Pressure Levels"] + pressures)
+
         filtered_df = df_all.copy()
         if selected_team != "All Teams":
-            filtered_df = filtered_df[(filtered_df["Batting_Team"] == selected_team) |
-                                      (filtered_df["Bowling_Team"] == selected_team)]
+            filtered_df = filtered_df[
+                (filtered_df["Batting_Team"] == selected_team) | (filtered_df["Bowling_Team"] == selected_team)
+                ]
         if selected_phase != "All Phases":
             filtered_df = filtered_df[filtered_df["Game_Phase"] == selected_phase]
         if selected_pressure != "All Pressure Levels":
             filtered_df = filtered_df[filtered_df["DynamicPressureLabel"] == selected_pressure]
+
         st.markdown(f"### Showing {len(filtered_df):,} of {len(df_all):,} rows")
         st.dataframe(filtered_df.head(500), use_container_width=True)
         if len(filtered_df) > 500:
             st.caption("Showing first 500 rows only. Apply more filters to see specific data.")
+
     st.markdown("---")
     st.markdown("""
     <div class="footer">
@@ -1481,6 +1622,8 @@ def main():
         <p>For more information on cricket analytics, visit <a href="https://cricviz.com/" target="_blank">CricViz</a></p>
     </div>
     """, unsafe_allow_html=True)
+
+    # Show performance insights
     display_performance_insights(df_all)
 
 
