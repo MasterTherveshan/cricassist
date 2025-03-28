@@ -358,26 +358,20 @@ def is_legal_delivery(delivery):
 
 def convert_match_json_to_ball_df(file_path):
     import json, os
-
-    def is_legal_delivery(delivery):
-        extras = delivery.get("extras", {})
-        return not ("wides" in extras or "noballs" in extras)
-
     with open(file_path, "r") as f:
         match_data = json.load(f)
 
     teams = match_data["info"].get("teams", [])
     match_type = match_data["info"].get("match_type", "T20")
     season = match_data["info"].get("season", "Unknown")
-
-    # Extract match_id from filename
+    # Extract match_id from filename (if needed)
     match_id = os.path.basename(file_path).split('.')[0]
 
     innings_list = match_data.get("innings", [])
     if not innings_list:
         return pd.DataFrame()
 
-    # Tally the first-innings total (for 2nd-innings pressure)
+    # Calculate first-innings total runs (for chase context)
     first_inn_runs = 0
     if len(innings_list) >= 1:
         for over_dict in innings_list[0].get("overs", []):
@@ -385,6 +379,7 @@ def convert_match_json_to_ball_df(file_path):
                 first_inn_runs += delivery.get("runs", {}).get("total", 0)
 
     ball_data = []
+    # Loop over innings
     for inn_idx, inn_data in enumerate(innings_list, start=1):
         batting_team = inn_data.get("team")
         if len(teams) == 2 and batting_team in teams:
@@ -392,7 +387,7 @@ def convert_match_json_to_ball_df(file_path):
         else:
             bowling_team = None
 
-        # Trackers
+        # Initialize trackers
         wickets_fallen = 0
         current_partnership = 0
         balls_since_boundary = 0
@@ -409,8 +404,7 @@ def convert_match_json_to_ball_df(file_path):
         for over_dict in overs_list:
             over_num = over_dict.get("over", 0)
             deliveries = over_dict.get("deliveries", [])
-
-            # If T20 and over >=17, or ODI and over >=47, "last 3 overs" logic
+            # Reset "last 3 overs" counter in final overs
             if match_type == "T20" and over_num >= 17:
                 last_3_overs_balls = 0
             elif match_type != "T20" and over_num >= 47:
@@ -421,39 +415,41 @@ def convert_match_json_to_ball_df(file_path):
                 total_runs += runs_total
                 batter_runs = delivery.get("runs", {}).get("batter", 0)
 
+                # Check wicket info
                 wickets_info = delivery.get("wickets", [])
                 wicket_fell = bool(wickets_info)
 
                 extras = delivery.get("extras", {})
-                is_legal = is_legal_delivery(delivery)
+                # A delivery is legal if it is not a wide or a no-ball
+                is_legal = not ("wides" in extras or "noballs" in extras)
                 if is_legal:
                     legal_balls += 1
 
-                # Striker faced a ball if not a wide
+                # A ball faced by the striker counts only if it is not a wide
                 balls_faced = 1 if "wides" not in extras else 0
 
-                # If final overs, update last_3_overs counters
-                if (match_type == "T20" and over_num >= 17) or \
-                   (match_type != "T20" and over_num >= 47):
+                # Update last-3-overs counters (if applicable)
+                if (match_type == "T20" and over_num >= 17) or (match_type != "T20" and over_num >= 47):
                     if is_legal:
                         last_3_overs_balls += 1
                     if wicket_fell:
                         wickets_in_last_3_overs += 1
 
-                # Boundaries
+                # Reset balls-since-boundary on a boundary
                 if batter_runs in [4, 6]:
                     balls_since_boundary = 0
                 else:
                     if is_legal:
                         balls_since_boundary += 1
 
-                # Partnerships & total wickets
+                # Update partnership and wickets tally
                 if wicket_fell:
                     wickets_fallen += 1
                     current_partnership = 0
                 else:
                     current_partnership += batter_runs
 
+                # Process bowler info
                 bowler = delivery.get("bowler")
                 if bowler:
                     if bowler not in bowler_current_wickets:
@@ -461,17 +457,14 @@ def convert_match_json_to_ball_df(file_path):
                         bowler_current_overs[bowler] = 0
                     if is_legal:
                         bowler_current_overs[bowler] += 1
-
-                    # Here’s the fix: only increment bowler wicket count if
-                    # the ‘kind’ is something attributed to the bowler
                     if wicket_fell:
+                        # For each wicket event, only count if the dismissal is attributable to the bowler.
                         for w in wickets_info:
-                            dis_kind = w.get("kind", "")
-                            # If not run out, obstructing field, retired hurt, etc. => credit the bowler
+                            dis_kind = w.get("kind", "").lower()
                             if dis_kind not in ["run out", "obstructing the field", "retired hurt"]:
                                 bowler_current_wickets[bowler] += 1
 
-                # Batter tracking
+                # Update batter runs
                 batter = delivery.get("batter")
                 non_striker = delivery.get("non_striker")
                 if batter not in batsman_current_runs:
@@ -484,12 +477,8 @@ def convert_match_json_to_ball_df(file_path):
                 if inn_idx == 2:
                     runs_needed = first_inn_runs - total_runs + 1
                     balls_left = (20 if match_type == "T20" else 50) * 6 - legal_balls
-                    if balls_left > 0:
-                        required_run_rate = runs_needed / (balls_left / 6.0)
-                    else:
-                        required_run_rate = 0
+                    required_run_rate = runs_needed / (balls_left / 6.0) if balls_left > 0 else 0
 
-                # Summarize ball event
                 if ball_index > 0 or over_num > 0:
                     if wicket_fell:
                         this_ball_result = "Wicket"
@@ -507,274 +496,19 @@ def convert_match_json_to_ball_df(file_path):
                 penalty_extras = extras.get("wides", 0) + extras.get("noballs", 0)
                 bowler_runs = batter_runs + penalty_extras
 
-                # Figure out who’s dismissed
+                # Determine dismissal details for the striker
                 striker_dismissed = any(w.get("player_out") == batter for w in wickets_info)
-                non_striker_dismissed = any(w.get("player_out") == non_striker for w in wickets_info)
-
-                # Build row for STRIKER
-                row_striker = {
-                    "Match_File": os.path.basename(file_path),
-                    "Season": season,
-                    "Innings_Index": inn_idx,
-                    "Batting_Team": batting_team,
-                    "Bowling_Team": bowling_team,
-                    "Batter": batter,
-                    "Non_Striker": non_striker,
-                    "Bowler": bowler,
-                    "Over": over_num,
-                    "Ball_In_Over": ball_index + 1,
-                    "Runs_Total": runs_total,
-                    "Runs_Batter": batter_runs,
-                    "Bowler_Runs": bowler_runs,
-                    "Match_Type": match_type,
-                    "IsLegalDelivery": 1 if is_legal else 0,
-                    "IsBattingDelivery": balls_faced,
-                    "Current_Score": f"{total_runs}-{wickets_fallen}",
-                    "Wickets_Fallen": wickets_fallen,
-                    "Current_Run_Rate": current_run_rate,
-                    "Required_Run_Rate": required_run_rate,
-                    "Current_Partnership": current_partnership,
-                    "Balls_Since_Boundary": balls_since_boundary,
-                    "Wickets_In_Last_3_Overs": wickets_in_last_3_overs,
-                    "Previous_Ball_Result": prev_ball_result,
-                    "Bowler_Current_Wickets": bowler_current_wickets.get(bowler, 0) if bowler else 0,
-                    "Bowler_Current_Overs": (bowler_current_overs.get(bowler, 0) / 6.0) if bowler else 0,
-                    "Strike_Batsman_Runs": batsman_current_runs[batter],
-                    "Batting_Task": "Setting" if inn_idx == 1 else "Chasing",
-                    "Bowling_Task": "Bowling First" if inn_idx == 1 else "Defending",
-                    "Balls_Faced": balls_faced,
-                    # Wicket = 1 only if striker was dismissed
-                    "Wicket": 1 if striker_dismissed else 0,
-                    "BatterDismissed": 1 if striker_dismissed else 0,
-                    "Mode_Of_Dismissal": None,
-                    "PlayerDismissed": None
-                }
-
+                mode_striker = None
                 if striker_dismissed:
-                    # find the record specifically for the striker
                     for w in wickets_info:
                         if w.get("player_out") == batter:
-                            row_striker["Mode_Of_Dismissal"] = w.get("kind", "Unknown")
-                            row_striker["PlayerDismissed"] = batter
+                            mode_striker = w.get("kind", "Unknown").lower()
                             break
+                # Only credit the bowler with a wicket if the dismissal is of the striker and is attributable
+                striker_wicket = 1 if (striker_dismissed and mode_striker not in ["run out", "obstructing the field",
+                                                                                  "retired hurt"]) else 0
 
-                # Build row for NON-STRIKER
-                row_non_striker = row_striker.copy()
-                row_non_striker["Batter"] = non_striker
-                row_non_striker["Balls_Faced"] = 0
-                row_non_striker["Runs_Batter"] = 0
-                row_non_striker["IsBattingDelivery"] = 0
-                row_non_striker["Strike_Batsman_Runs"] = 0
-                row_non_striker["Wicket"] = 1 if non_striker_dismissed else 0
-                row_non_striker["BatterDismissed"] = 1 if non_striker_dismissed else 0
-                row_non_striker["Mode_Of_Dismissal"] = None
-                row_non_striker["PlayerDismissed"] = None
-                if non_striker_dismissed:
-                    for w in wickets_info:
-                        if w.get("player_out") == non_striker:
-                            row_non_striker["Mode_Of_Dismissal"] = w.get("kind", "Unknown")
-                            row_non_striker["PlayerDismissed"] = non_striker
-                            break
-
-                # Append both rows
-                ball_data.append(row_striker)
-                ball_data.append(row_non_striker)
-                prev_ball_result = this_ball_result
-
-    # Turn into DataFrame
-    df = pd.DataFrame(ball_data)
-    if df.empty:
-        return df
-
-    # Label the overs as phases
-    def game_phase_t20(over):
-        if over < 6:
-            return "Powerplay"
-        elif over < 16:
-            return "Middle"
-        else:
-            return "Death"
-
-    def game_phase_50(over):
-        if over < 10:
-            return "Powerplay"
-        elif over < 40:
-            return "Middle"
-        else:
-            return "Death"
-
-    if match_type == "T20":
-        df["Game_Phase"] = df["Over"].apply(game_phase_t20)
-    else:
-        df["Game_Phase"] = df["Over"].apply(game_phase_50)
-
-    phase_map = {"Powerplay": "Low", "Middle": "Medium", "Death": "High"}
-    df["Pressure"] = df["Game_Phase"].map(phase_map)
-
-    # Finally, group each innings to add dynamic pressure
-    out_chunks = []
-    for (mf, idx), chunk in df.groupby(["Match_File", "Innings_Index"]):
-        chunk = chunk.copy()
-        if idx == 2:
-            chunk = calculate_dynamic_pressure_for_innings(chunk, first_innings_total=first_inn_runs)
-        else:
-            chunk = calculate_dynamic_pressure_for_innings(chunk, first_innings_total=None)
-        out_chunks.append(chunk)
-
-    return pd.concat(out_chunks, ignore_index=True)
-    import json, os
-    
-    with open(file_path, "r") as f:
-        match_data = json.load(f)
-
-    teams = match_data["info"].get("teams", [])
-    match_type = match_data["info"].get("match_type", "T20")
-    season = match_data["info"].get("season", "Unknown")
-
-    # Extract the match_id from the filename
-    match_id = os.path.basename(file_path).split('.')[0]
-
-    innings_list = match_data.get("innings", [])
-    if not innings_list:
-        return pd.DataFrame()
-
-    # If there's a first innings, total up its runs for the chase context
-    first_inn_runs = 0
-    if len(innings_list) >= 1:
-        for over_dict in innings_list[0].get("overs", []):
-            for delivery in over_dict.get("deliveries", []):
-                first_inn_runs += delivery.get("runs", {}).get("total", 0)
-
-    ball_data = []
-    for inn_idx, inn_data in enumerate(innings_list, start=1):
-        batting_team = inn_data.get("team")
-        # Identify the bowling team if we have both teams
-        if len(teams) == 2 and batting_team in teams:
-            bowling_team = [t for t in teams if t != batting_team][0]
-        else:
-            bowling_team = None
-
-        # Trackers
-        wickets_fallen = 0
-        current_partnership = 0
-        balls_since_boundary = 0
-        wickets_in_last_3_overs = 0
-        last_3_overs_balls = 0
-        total_runs = 0
-        legal_balls = 0
-        prev_ball_result = None
-        bowler_current_wickets = {}
-        bowler_current_overs = {}
-        batsman_current_runs = {}
-
-        overs_list = inn_data.get("overs", [])
-        for over_dict in overs_list:
-            over_num = over_dict.get("over", 0)
-            deliveries = over_dict.get("deliveries", [])
-
-            # For T20 final overs or ODIs final overs, reset last_3_overs counters
-            if match_type == "T20" and over_num >= 17:
-                last_3_overs_balls = 0
-            elif match_type != "T20" and over_num >= 47:
-                last_3_overs_balls = 0
-
-            for ball_index, delivery in enumerate(deliveries):
-                runs_total = delivery.get("runs", {}).get("total", 0)
-                total_runs += runs_total
-                batter_runs = delivery.get("runs", {}).get("batter", 0)
-
-                # Check if any wicket fell
-                wickets_info = delivery.get("wickets", [])
-                wicket_fell = bool(wickets_info)
-
-                # Check extras for wide/no-ball
-                extras = delivery.get("extras", {})
-                is_legal = not ("wides" in extras or "noballs" in extras)
-
-                if is_legal:
-                    legal_balls += 1
-
-                # If not a wide, the striker faced a ball
-                balls_faced = 1 if "wides" not in extras else 0
-
-                # If we are in final overs, update last_3_overs counters
-                if (match_type == "T20" and over_num >= 17) or (match_type != "T20" and over_num >= 47):
-                    if is_legal:
-                        last_3_overs_balls += 1
-                    if wicket_fell:
-                        wickets_in_last_3_overs += 1
-
-                # Boundary or not
-                if batter_runs in [4, 6]:
-                    balls_since_boundary = 0
-                else:
-                    if is_legal:
-                        balls_since_boundary += 1
-
-                # Partnerships & wickets
-                if wicket_fell:
-                    wickets_fallen += 1
-                    current_partnership = 0
-                else:
-                    current_partnership += batter_runs
-
-                # Bowler info
-                bowler = delivery.get("bowler")
-                if bowler:
-                    if bowler not in bowler_current_wickets:
-                        bowler_current_wickets[bowler] = 0
-                        bowler_current_overs[bowler] = 0
-                    if is_legal:
-                        bowler_current_overs[bowler] += 1
-                    if wicket_fell:
-                        # We increment the bowler's "taken wicket" count,
-                        # but we'll fix double counting in the final "Wicket" field
-                        bowler_current_wickets[bowler] += 1
-
-                # Batter (striker) info
-                batter = delivery.get("batter")
-                non_striker = delivery.get("non_striker")
-                if batter not in batsman_current_runs:
-                    batsman_current_runs[batter] = 0
-                batsman_current_runs[batter] += batter_runs
-
-                overs_completed = legal_balls / 6.0
-                current_run_rate = (total_runs / overs_completed) if overs_completed > 0 else 0
-                required_run_rate = None
-
-                # For 2nd innings, figure out chase context
-                if inn_idx == 2:
-                    runs_needed = first_inn_runs - total_runs + 1
-                    balls_left = 120 - legal_balls
-                    if balls_left > 0:
-                        required_run_rate = runs_needed / (balls_left / 6.0)
-                    else:
-                        required_run_rate = 0
-
-                # Create a simple "ball result" label
-                if ball_index > 0 or over_num > 0:
-                    if wicket_fell:
-                        this_ball_result = "Wicket"
-                    elif batter_runs == 0 and not extras:
-                        this_ball_result = "Dot"
-                    elif batter_runs in [4, 6]:
-                        this_ball_result = "Boundary"
-                    elif extras:
-                        this_ball_result = "Extra"
-                    else:
-                        this_ball_result = str(batter_runs)
-                else:
-                    this_ball_result = None
-
-                # If there's a wide or no-ball, add that to bowler_runs
-                penalty_extras = extras.get("wides", 0) + extras.get("noballs", 0)
-                bowler_runs = batter_runs + penalty_extras
-
-                # Figure out who is actually dismissed
-                striker_dismissed = any(w.get("player_out") == batter for w in wickets_info)
-                non_striker_dismissed = any(w.get("player_out") == non_striker for w in wickets_info)
-
-                # Build the striker row
+                # Build the striker row (this row represents the delivery for the batter facing the ball)
                 row_striker = {
                     "Match_File": os.path.basename(file_path),
                     "Season": season,
@@ -806,41 +540,33 @@ def convert_match_json_to_ball_df(file_path):
                     "Batting_Task": "Setting" if inn_idx == 1 else "Chasing",
                     "Bowling_Task": "Bowling First" if inn_idx == 1 else "Defending",
                     "Balls_Faced": balls_faced,
-                    # Set 'Wicket' = 1 only if the STRIKER was actually dismissed
-                    "Wicket": 1 if striker_dismissed else 0,
-                    "BatterDismissed": 1 if striker_dismissed else 0
+                    "Wicket": striker_wicket,
+                    "BatterDismissed": 1 if striker_dismissed else 0,
+                    "Mode_Of_Dismissal": mode_striker,
+                    "PlayerDismissed": batter if striker_dismissed else None,
+                    "DeliveryType": "striker"
                 }
 
-                # If there's at least one wicket event, store the first in 'Mode_Of_Dismissal', etc.
-                # But only if it was the striker who got out.
-                row_striker["Mode_Of_Dismissal"] = None
-                row_striker["PlayerDismissed"] = None
-                if striker_dismissed:
-                    # find the record specifically for the striker
-                    for w in wickets_info:
-                        if w.get("player_out") == batter:
-                            row_striker["Mode_Of_Dismissal"] = w.get("kind", "Unknown")
-                            row_striker["PlayerDismissed"] = batter
-                            break
-
-                # Build the non-striker row
+                # Build the non-striker row (to capture run-out details etc.)
                 row_non_striker = row_striker.copy()
                 row_non_striker["Batter"] = non_striker
-                row_non_striker["Balls_Faced"] = 0
+                row_non_striker["Balls_Faced"] = 0  # non-striker does not face the ball
                 row_non_striker["Runs_Batter"] = 0
                 row_non_striker["IsBattingDelivery"] = 0
                 row_non_striker["Strike_Batsman_Runs"] = 0
-                # If the non-striker was run out, mark Wicket=1 only for them
-                row_non_striker["Wicket"] = 1 if non_striker_dismissed else 0
-                row_non_striker["BatterDismissed"] = 1 if non_striker_dismissed else 0
-                row_non_striker["Mode_Of_Dismissal"] = None
-                row_non_striker["PlayerDismissed"] = None
-                if non_striker_dismissed:
+                # For non-striker, do not credit any wicket to the bowler.
+                row_non_striker["Wicket"] = 0
+                row_non_striker["BatterDismissed"] = 1 if any(
+                    w.get("player_out") == non_striker for w in wickets_info) else 0
+                mode_non_striker = None
+                if any(w.get("player_out") == non_striker for w in wickets_info):
                     for w in wickets_info:
                         if w.get("player_out") == non_striker:
-                            row_non_striker["Mode_Of_Dismissal"] = w.get("kind", "Unknown")
-                            row_non_striker["PlayerDismissed"] = non_striker
+                            mode_non_striker = w.get("kind", "Unknown").lower()
                             break
+                row_non_striker["Mode_Of_Dismissal"] = mode_non_striker
+                row_non_striker["PlayerDismissed"] = non_striker if row_non_striker["BatterDismissed"] == 1 else None
+                row_non_striker["DeliveryType"] = "non-striker"
 
                 ball_data.append(row_striker)
                 ball_data.append(row_non_striker)
@@ -850,7 +576,7 @@ def convert_match_json_to_ball_df(file_path):
     if df.empty:
         return df
 
-    # Label game phase
+    # Label game phase based on over number
     def game_phase_t20(over):
         if over < 6:
             return "Powerplay"
@@ -871,12 +597,10 @@ def convert_match_json_to_ball_df(file_path):
         df["Game_Phase"] = df["Over"].apply(game_phase_t20)
     else:
         df["Game_Phase"] = df["Over"].apply(game_phase_50)
-
-    # Map a general "Pressure" field based on overs
     phase_map = {"Powerplay": "Low", "Middle": "Medium", "Death": "High"}
     df["Pressure"] = df["Game_Phase"].map(phase_map)
 
-    # Now group by innings to add dynamic pressure
+    # Add dynamic pressure to each innings group
     out_chunks = []
     for (mf, idx), chunk in df.groupby(["Match_File", "Innings_Index"]):
         chunk = chunk.copy()
@@ -885,242 +609,8 @@ def convert_match_json_to_ball_df(file_path):
         else:
             chunk = calculate_dynamic_pressure_for_innings(chunk, first_innings_total=None)
         out_chunks.append(chunk)
-
     return pd.concat(out_chunks, ignore_index=True)
-    with open(file_path, "r") as f:
-        match_data = json.load(f)
 
-    teams = match_data["info"].get("teams", [])
-    match_type = match_data["info"].get("match_type", "T20")
-    season = match_data["info"].get("season", "Unknown")
-
-    # Extract ID from filename
-    match_id = os.path.basename(file_path).split('.')[0]
-    innings_list = match_data.get("innings", [])
-    if not innings_list:
-        return pd.DataFrame()
-
-    # For chase context
-    first_inn_runs = 0
-    if len(innings_list) >= 1:
-        for over_dict in innings_list[0].get("overs", []):
-            for delivery in over_dict.get("deliveries", []):
-                first_inn_runs += delivery.get("runs", {}).get("total", 0)
-
-    ball_data = []
-    for inn_idx, inn_data in enumerate(innings_list, start=1):
-        batting_team = inn_data.get("team")
-        if len(teams) > 1:
-            bowling_team = [t for t in teams if t != batting_team][0]
-        else:
-            bowling_team = None
-
-        # Trackers
-        wickets_fallen = 0
-        current_partnership = 0
-        balls_since_boundary = 0
-        wickets_in_last_3_overs = 0
-        last_3_overs_balls = 0
-        total_runs = 0
-        legal_balls = 0
-        prev_ball_result = None
-        bowler_current_wickets = {}
-        bowler_current_overs = {}
-        batsman_current_runs = {}
-
-        for over_dict in inn_data.get("overs", []):
-            over_num = over_dict["over"]
-            deliveries = over_dict.get("deliveries", [])
-
-            # Reset if final overs
-            if match_type=="T20" and over_num>=17:
-                last_3_overs_balls=0
-            elif match_type!="T20" and over_num>=47:
-                last_3_overs_balls=0
-
-            for ball_index, delivery in enumerate(deliveries):
-                total_runs += delivery["runs"]["total"]
-                batter_runs = delivery["runs"].get("batter", 0)
-                wicket_fell = bool(delivery.get("wickets"))
-
-                extras = delivery.get("extras", {})
-                is_legal = is_legal_delivery(delivery)
-                if is_legal:
-                    legal_balls += 1
-
-                # Striker faced ball if not wide
-                balls_faced = 1 if "wides" not in extras else 0
-                if (match_type=="T20" and over_num>=17) or (match_type!="T20" and over_num>=47):
-                    if is_legal:
-                        last_3_overs_balls+=1
-                    if wicket_fell:
-                        wickets_in_last_3_overs+=1
-
-                if batter_runs in [4,6]:
-                    balls_since_boundary=0
-                else:
-                    if is_legal:
-                        balls_since_boundary+=1
-
-                if wicket_fell:
-                    wickets_fallen+=1
-                    current_partnership=0
-                else:
-                    current_partnership+=batter_runs
-
-                bowler=delivery.get("bowler")
-                if bowler:
-                    if bowler not in bowler_current_wickets:
-                        bowler_current_wickets[bowler]=0
-                        bowler_current_overs[bowler]=0
-                    if is_legal:
-                        bowler_current_overs[bowler]+=1
-                    if wicket_fell:
-                        bowler_current_wickets[bowler]+=1
-
-                batter = delivery.get("batter")
-                non_striker = delivery.get("non_striker")
-
-                if batter not in batsman_current_runs:
-                    batsman_current_runs[batter]=0
-                batsman_current_runs[batter]+=batter_runs
-
-                overs_completed=legal_balls/6.0
-                current_run_rate = total_runs/overs_completed if overs_completed>0 else 0
-                required_run_rate=None
-                if inn_idx==2:
-                    runs_needed=first_inn_runs - total_runs + 1
-                    balls_left=(20 if match_type=="T20" else 50)*6 - legal_balls
-                    required_run_rate=(runs_needed/(balls_left/6.0)) if balls_left>0 else 0
-
-                # Basic result
-                if ball_index>0 or over_num>0:
-                    if wicket_fell:
-                        this_ball_result="Wicket"
-                    elif batter_runs==0 and not extras:
-                        this_ball_result="Dot"
-                    elif batter_runs in [4,6]:
-                        this_ball_result="Boundary"
-                    elif extras:
-                        this_ball_result="Extra"
-                    else:
-                        this_ball_result=str(batter_runs)
-                else:
-                    this_ball_result=None
-
-                penalty_extras = extras.get("wides", 0)+extras.get("noballs", 0)
-                bowler_runs = batter_runs + penalty_extras
-
-                # Determine who got out
-                wickets_info = delivery.get("wickets", [])
-                striker_dismissed = any(w.get("player_out")==batter for w in wickets_info)
-                non_striker_dismissed = any(w.get("player_out")==non_striker for w in wickets_info)
-
-                # Build row for the STRIKER
-                row_striker = {
-                    "Match_File": os.path.basename(file_path),
-                    "Season": season,
-                    "Innings_Index": inn_idx,
-                    "Batting_Team": batting_team,
-                    "Bowling_Team": bowling_team,
-                    "Batter": batter,
-                    "Non_Striker": non_striker,
-                    "Bowler": bowler,
-                    "Over": over_num,
-                    "Ball_In_Over": ball_index+1,
-                    "Runs_Total": delivery["runs"]["total"],
-                    "Runs_Batter": batter_runs,
-                    "Bowler_Runs": bowler_runs,
-                    "Wicket": 1 if wicket_fell else 0,
-                    "Match_Type": match_type,
-                    "IsLegalDelivery": 1 if is_legal else 0,
-                    "IsBattingDelivery": balls_faced,
-                    "Current_Score": f"{total_runs}-{wickets_fallen}",
-                    "Wickets_Fallen": wickets_fallen,
-                    "Current_Run_Rate": current_run_rate,
-                    "Required_Run_Rate": required_run_rate,
-                    "Current_Partnership": current_partnership,
-                    "Balls_Since_Boundary": balls_since_boundary,
-                    "Wickets_In_Last_3_Overs": wickets_in_last_3_overs,
-                    "Previous_Ball_Result": prev_ball_result,
-                    "Bowler_Current_Wickets": bowler_current_wickets.get(bowler,0) if bowler else 0,
-                    "Bowler_Current_Overs": bowler_current_overs.get(bowler,0)/6.0 if bowler else 0,
-                    "Strike_Batsman_Runs": batsman_current_runs[batter],
-                    "Batting_Task": "Setting" if inn_idx==1 else "Chasing",
-                    "Bowling_Task": "Bowling First" if inn_idx==1 else "Defending",
-                    "Balls_Faced": balls_faced,
-                    "BatterDismissed": 1 if striker_dismissed else 0
-                }
-
-                if wicket_fell and wickets_info:
-                    row_striker["Mode_Of_Dismissal"] = wickets_info[0].get("kind","Unknown")
-                    row_striker["PlayerDismissed"] = wickets_info[0].get("player_out")
-                else:
-                    row_striker["Mode_Of_Dismissal"] = None
-                    row_striker["PlayerDismissed"] = None
-
-                ball_data.append(row_striker)
-
-                # Build row for the NON-STRIKER to capture run-outs, etc.
-                row_non_striker = row_striker.copy()
-                row_non_striker["Batter"] = non_striker
-                row_non_striker["Balls_Faced"] = 0       # non-striker isn't facing
-                row_non_striker["Runs_Batter"] = 0
-                row_non_striker["IsBattingDelivery"] = 0
-                row_non_striker["Strike_Batsman_Runs"] = 0
-                row_non_striker["BatterDismissed"] = 1 if non_striker_dismissed else 0
-                # If the non-striker was run out, set their dismissal mode:
-                row_non_striker["Mode_Of_Dismissal"] = None
-                row_non_striker["PlayerDismissed"] = None
-                if non_striker_dismissed and wickets_info:
-                    for w in wickets_info:
-                        if w["player_out"] == non_striker:
-                            row_non_striker["Mode_Of_Dismissal"] = w.get("kind","Unknown")
-                            row_non_striker["PlayerDismissed"] = non_striker
-                            break
-
-                ball_data.append(row_non_striker)
-                prev_ball_result=this_ball_result
-
-    df = pd.DataFrame(ball_data)
-    if df.empty:
-        return df
-
-    # Label game phase
-    def game_phase_t20(over):
-        if over<6:
-            return "Powerplay"
-        elif over<16:
-            return "Middle"
-        else:
-            return "Death"
-
-    def game_phase_50(over):
-        if over<10:
-            return "Powerplay"
-        elif over<40:
-            return "Middle"
-        else:
-            return "Death"
-
-    if match_type=="T20":
-        df["Game_Phase"] = df["Over"].apply(game_phase_t20)
-    else:
-        df["Game_Phase"] = df["Over"].apply(game_phase_50)
-
-    phase_map={"Powerplay":"Low","Middle":"Medium","Death":"High"}
-    df["Pressure"]=df["Game_Phase"].map(phase_map)
-
-    # Add dynamic pressure
-    out_chunks=[]
-    for (mf, idx), chunk in df.groupby(["Match_File","Innings_Index"]):
-        chunk=chunk.copy()
-        if idx==2:
-            chunk=calculate_dynamic_pressure_for_innings(chunk,first_innings_total=first_inn_runs)
-        else:
-            chunk=calculate_dynamic_pressure_for_innings(chunk,first_innings_total=None)
-        out_chunks.append(chunk)
-    return pd.concat(out_chunks, ignore_index=True)
 
 ############################################
 # 4) GAMES PLAYED HELPERS
@@ -1145,7 +635,7 @@ def compute_bowling_games_played(df):
 def compute_batting_metrics_by_pressure(df, pressure_col="DynamicPressureLabel"):
     if df.empty:
         return pd.DataFrame(columns=["Batter", pressure_col, "Runs", "Balls", "Dismissals", "StrikeRate", "DotBallPct"])
-    sub = df.dropna(subset=["Batter"]).copy()
+    sub = df[df["DeliveryType"] == "striker"].dropna(subset=["Bowler"]).copy()
     sub["Balls_Faced"] = sub["IsBattingDelivery"]
     sub["DotBall"] = sub.apply(
         lambda row: 1 if (row["Runs_Batter"] == 0 and not row["Wicket"] and row["IsBattingDelivery"] == 1) else 0,
@@ -1171,7 +661,8 @@ def compute_batting_metrics_by_pressure(df, pressure_col="DynamicPressureLabel")
 def compute_bowling_metrics_by_pressure(df, pressure_col="DynamicPressureLabel"):
     if df.empty:
         return pd.DataFrame(columns=["Bowler", pressure_col, "Balls", "Runs", "Wickets", "Economy", "DotBallPct"])
-    sub = df.dropna(subset=["Bowler"]).copy()
+    # Use only striker deliveries
+    sub = df[df["DeliveryType"] == "striker"].dropna(subset=["Bowler"]).copy()
     sub["Balls_Bowled"] = sub["IsLegalDelivery"]
     sub["DotBall"] = sub.apply(
         lambda row: 1 if (row["Runs_Batter"] == 0 and row["IsLegalDelivery"] == 1) else 0,
@@ -1315,7 +806,8 @@ def compute_advanced_bowling_metrics(df):
             "Bowler", "Wickets", "Economy", "StrikeRate",
             "BounceBackRate", "KeyWicketIndex", "DeathOversEconomy"
         ])
-    sub = df.dropna(subset=["Bowler"]).copy()
+    # Use only striker deliveries
+    sub = df[df["DeliveryType"] == "striker"].dropna(subset=["Bowler"]).copy()
     sub["LegalDelivery"] = sub["IsLegalDelivery"]
     sub["KeyWicket"] = sub.apply(
         lambda row: 1 if row["Wicket"] and (
