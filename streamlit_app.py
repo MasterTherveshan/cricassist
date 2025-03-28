@@ -972,10 +972,25 @@ def main():
                     display_df = sub_bat.copy()
                     display_df["StrikeRate"] = display_df["StrikeRate"].round(2)
                     display_df["DotBallPct"] = (display_df["DotBallPct"] * 100).round(2).astype(str) + '%'
+                    
+                    # Order for display
+                    order = ["Low", "Medium", "High", "Extreme"]
+                    display_df["DynamicPressureLabel"] = pd.Categorical(
+                        display_df["DynamicPressureLabel"], 
+                        categories=order, 
+                        ordered=True
+                    )
+                    display_df = display_df.sort_values("DynamicPressureLabel")
                     st.dataframe(display_df, use_container_width=True)
 
-                    # Charts with improved styling
+                    # Charts with improved styling - with proper ordering
                     st.markdown("### Strike Rate Comparison")
+                    # Create ordered category for plotting
+                    sub_bat["DynamicPressureLabel"] = pd.Categorical(
+                        sub_bat["DynamicPressureLabel"], 
+                        categories=order, 
+                        ordered=True
+                    )
                     fig_bat = px.bar(
                         sub_bat,
                         x="DynamicPressureLabel",
@@ -984,7 +999,8 @@ def main():
                         barmode="group",
                         title="Batting Strike Rate by Pressure Level",
                         color_discrete_sequence=px.colors.qualitative.Bold,
-                        labels={"DynamicPressureLabel": "Pressure Level", "StrikeRate": "Strike Rate"}
+                        labels={"DynamicPressureLabel": "Pressure Level", "StrikeRate": "Strike Rate"},
+                        category_orders={"DynamicPressureLabel": order}
                     )
                     fig_bat.update_layout(
                         template="plotly_dark",
@@ -1004,6 +1020,7 @@ def main():
                     st.plotly_chart(fig_bat, use_container_width=True)
 
                     st.markdown("### Dot Ball Percentage Comparison")
+                    # Same for the second chart
                     fig_bat2 = px.bar(
                         sub_bat,
                         x="DynamicPressureLabel",
@@ -1012,7 +1029,8 @@ def main():
                         barmode="group",
                         title="Dot Ball % by Pressure Level",
                         color_discrete_sequence=px.colors.qualitative.Bold,
-                        labels={"DynamicPressureLabel": "Pressure Level", "DotBallPct": "Dot Ball %"}
+                        labels={"DynamicPressureLabel": "Pressure Level", "DotBallPct": "Dot Ball %"},
+                        category_orders={"DynamicPressureLabel": order}
                     )
                     fig_bat2.update_layout(
                         template="plotly_dark",
@@ -1073,10 +1091,25 @@ def main():
                     display_df = sub_bowl.copy()
                     display_df["Economy"] = display_df["Economy"].round(2)
                     display_df["DotBallPct"] = (display_df["DotBallPct"] * 100).round(2).astype(str) + '%'
+                    
+                    # Order for display
+                    order = ["Low", "Medium", "High", "Extreme"]
+                    display_df["DynamicPressureLabel"] = pd.Categorical(
+                        display_df["DynamicPressureLabel"], 
+                        categories=order, 
+                        ordered=True
+                    )
+                    display_df = display_df.sort_values("DynamicPressureLabel")
                     st.dataframe(display_df, use_container_width=True)
 
-                    # Charts with improved styling
+                    # Charts with improved styling - with proper ordering
                     st.markdown("### Economy Rate Comparison")
+                    # Create ordered category for plotting
+                    sub_bowl["DynamicPressureLabel"] = pd.Categorical(
+                        sub_bowl["DynamicPressureLabel"], 
+                        categories=order, 
+                        ordered=True
+                    )
                     fig_bowl = px.bar(
                         sub_bowl,
                         x="DynamicPressureLabel",
@@ -1085,7 +1118,8 @@ def main():
                         barmode="group",
                         title="Bowling Economy by Pressure Level",
                         color_discrete_sequence=px.colors.qualitative.Bold,
-                        labels={"DynamicPressureLabel": "Pressure Level", "Economy": "Economy Rate (RPO)"}
+                        labels={"DynamicPressureLabel": "Pressure Level", "Economy": "Economy Rate (RPO)"},
+                        category_orders={"DynamicPressureLabel": order}
                     )
                     fig_bowl.update_layout(
                         template="plotly_dark",
@@ -1105,6 +1139,7 @@ def main():
                     st.plotly_chart(fig_bowl, use_container_width=True)
 
                     st.markdown("### Dot Ball Percentage Comparison")
+                    # Same for the second chart
                     fig_bowl2 = px.bar(
                         sub_bowl,
                         x="DynamicPressureLabel",
@@ -1113,7 +1148,8 @@ def main():
                         barmode="group",
                         title="Bowling Dot Ball % by Pressure Level",
                         color_discrete_sequence=px.colors.qualitative.Bold,
-                        labels={"DynamicPressureLabel": "Pressure Level", "DotBallPct": "Dot Ball %"}
+                        labels={"DynamicPressureLabel": "Pressure Level", "DotBallPct": "Dot Ball %"},
+                        category_orders={"DynamicPressureLabel": order}
                     )
                     fig_bowl2.update_layout(
                         template="plotly_dark",
